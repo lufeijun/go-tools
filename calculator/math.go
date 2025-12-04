@@ -1,4 +1,4 @@
-package add
+package calculator
 
 // 定义支持的数字类型
 type Number interface {
