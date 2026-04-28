@@ -1,3 +1,3 @@
-module github.com/lufeijun/go-tools
+module github.com/lufeijun/goTools
 
-go 1.25.0
+go 1.24.4
