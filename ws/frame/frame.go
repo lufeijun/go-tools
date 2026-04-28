@@ -112,3 +112,75 @@ func WriteFrame(w io.Writer, f Frame) error {
 	_, err := w.Write(f.Payload)
 	return err
 }
+
+func ReadFrame(r io.Reader) (Frame, error) {
+	var result Frame
+	var header [2]byte
+
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return Frame{}, err
+	}
+
+	result.FIN = header[0]&0x80 != 0
+	result.RSV1 = header[0]&0x40 != 0
+	result.RSV2 = header[0]&0x20 != 0
+	result.RSV3 = header[0]&0x10 != 0
+	result.Opcode = Opcode(header[0] & 0x0F)
+
+	result.Masked = header[1]&0x80 != 0
+	payloadLen := int(header[1] & 0x7F)
+
+	switch payloadLen {
+	case 126:
+		var lenBytes [2]byte
+		if _, err := io.ReadFull(r, lenBytes[:]); err != nil {
+			return Frame{}, err
+		}
+		payloadLen = int(binary.BigEndian.Uint16(lenBytes[:]))
+	case 127:
+		var lenBytes [8]byte
+		if _, err := io.ReadFull(r, lenBytes[:]); err != nil {
+			return Frame{}, err
+		}
+		payloadLen = int(binary.BigEndian.Uint64(lenBytes[:]))
+	}
+
+	if result.Masked {
+		if _, err := io.ReadFull(r, result.MaskKey[:]); err != nil {
+			return Frame{}, err
+		}
+	}
+
+	if payloadLen > 0 {
+		result.Payload = make([]byte, payloadLen)
+		if _, err := io.ReadFull(r, result.Payload); err != nil {
+			return Frame{}, err
+		}
+		if result.Masked {
+			result.Payload = applyMask(result.Payload, result.MaskKey)
+			result.Masked = false
+		}
+	}
+
+	// Handle fragmentation: non-FIN frames continue reading continuation frames
+	if !result.FIN {
+		firstOpcode := result.Opcode
+		accumulated := result.Payload
+
+		for {
+			next, err := ReadFrame(r)
+			if err != nil {
+				return Frame{}, err
+			}
+			accumulated = append(accumulated, next.Payload...)
+			if next.FIN {
+				result.FIN = true
+				result.Opcode = firstOpcode
+				result.Payload = accumulated
+				break
+			}
+		}
+	}
+
+	return result, nil
+}

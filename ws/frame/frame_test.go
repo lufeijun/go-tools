@@ -2,6 +2,7 @@ package frame
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -126,5 +127,115 @@ func TestWriteFrame_LargePayload(t *testing.T) {
 
 	if buf.Bytes()[1] != 0x7F {
 		t.Errorf("length indicator = %x, want 0x7F", buf.Bytes()[1])
+	}
+}
+
+func TestReadFrame_TextUnmasked(t *testing.T) {
+	raw := []byte{0x81, 0x05, 'H', 'e', 'l', 'l', 'o'}
+	f, err := ReadFrame(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.FIN {
+		t.Error("FIN = false, want true")
+	}
+	if f.Opcode != OpcodeText {
+		t.Errorf("Opcode = %d, want %d", f.Opcode, OpcodeText)
+	}
+	if string(f.Payload) != "Hello" {
+		t.Errorf("Payload = %q, want %q", string(f.Payload), "Hello")
+	}
+}
+
+func TestReadFrame_Masked(t *testing.T) {
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	original := []byte("Hello")
+	masked := applyMask(original, key)
+
+	raw := []byte{0x81, 0x85}
+	raw = append(raw, key[:]...)
+	raw = append(raw, masked...)
+
+	f, err := ReadFrame(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(f.Payload) != "Hello" {
+		t.Errorf("Payload = %q, want %q", string(f.Payload), "Hello")
+	}
+}
+
+func TestReadFrame_Ping(t *testing.T) {
+	raw := []byte{0x89, 0x00}
+	f, err := ReadFrame(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Opcode != OpcodePing {
+		t.Errorf("Opcode = %d, want Ping", f.Opcode)
+	}
+}
+
+func TestReadFrame_16bitLength(t *testing.T) {
+	payload := make([]byte, 200)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	var buf bytes.Buffer
+	WriteFrame(&buf, Frame{FIN: true, Opcode: OpcodeBinary, Payload: payload})
+
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Payload) != 200 {
+		t.Errorf("Payload len = %d, want 200", len(f.Payload))
+	}
+}
+
+func TestReadFrame_CloseWithStatus(t *testing.T) {
+	payload := make([]byte, 2)
+	binary.BigEndian.PutUint16(payload, 1000)
+	payload = append(payload, "normal"...)
+
+	var buf bytes.Buffer
+	WriteFrame(&buf, Frame{FIN: true, Opcode: OpcodeClose, Payload: payload})
+
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Opcode != OpcodeClose {
+		t.Errorf("Opcode = %d, want Close", f.Opcode)
+	}
+	code := binary.BigEndian.Uint16(f.Payload[:2])
+	if code != 1000 {
+		t.Errorf("Close code = %d, want 1000", code)
+	}
+}
+
+func TestReadFrame_Fragmentation(t *testing.T) {
+	frag1 := Frame{FIN: false, Opcode: OpcodeText, Payload: []byte("Hel")}
+	frag2 := Frame{FIN: false, Opcode: 0, Payload: []byte("lo ")}
+	frag3 := Frame{FIN: true, Opcode: 0, Payload: []byte("World")}
+
+	var buf bytes.Buffer
+	WriteFrame(&buf, frag1)
+	WriteFrame(&buf, frag2)
+	WriteFrame(&buf, frag3)
+
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.FIN {
+		t.Error("FIN = false, want true (reassembled)")
+	}
+	if f.Opcode != OpcodeText {
+		t.Errorf("Opcode = %d, want Text", f.Opcode)
+	}
+	if string(f.Payload) != "Hello World" {
+		t.Errorf("Payload = %q, want %q", string(f.Payload), "Hello World")
 	}
 }
