@@ -50,7 +50,7 @@ func NewCloseFrame(code uint16, reason string) Frame {
 }
 
 func WriteFrame(w io.Writer, f Frame) error {
-	header := make([]byte, 0, 14)
+	buf := make([]byte, 0, 14+len(f.Payload))
 
 	b1 := byte(f.Opcode)
 	if f.FIN {
@@ -65,7 +65,7 @@ func WriteFrame(w io.Writer, f Frame) error {
 	if f.RSV3 {
 		b1 |= 0x10
 	}
-	header = append(header, b1)
+	buf = append(buf, b1)
 
 	b2 := byte(0)
 	if f.Masked {
@@ -76,40 +76,29 @@ func WriteFrame(w io.Writer, f Frame) error {
 	switch {
 	case payloadLen <= 125:
 		b2 |= byte(payloadLen)
-		header = append(header, b2)
+		buf = append(buf, b2)
 	case payloadLen <= 65535:
 		b2 |= 126
-		header = append(header, b2)
+		buf = append(buf, b2)
 		lenBytes := make([]byte, 2)
 		binary.BigEndian.PutUint16(lenBytes, uint16(payloadLen))
-		header = append(header, lenBytes...)
+		buf = append(buf, lenBytes...)
 	default:
 		b2 |= 127
-		header = append(header, b2)
+		buf = append(buf, b2)
 		lenBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(lenBytes, uint64(payloadLen))
-		header = append(header, lenBytes...)
+		buf = append(buf, lenBytes...)
 	}
 
 	if f.Masked {
-		header = append(header, f.MaskKey[:]...)
+		buf = append(buf, f.MaskKey[:]...)
+		buf = append(buf, applyMask(f.Payload, f.MaskKey)...)
+	} else if payloadLen > 0 {
+		buf = append(buf, f.Payload...)
 	}
 
-	if _, err := w.Write(header); err != nil {
-		return err
-	}
-
-	if payloadLen == 0 {
-		return nil
-	}
-
-	if f.Masked {
-		masked := applyMask(f.Payload, f.MaskKey)
-		_, err := w.Write(masked)
-		return err
-	}
-
-	_, err := w.Write(f.Payload)
+	_, err := w.Write(buf)
 	return err
 }
 

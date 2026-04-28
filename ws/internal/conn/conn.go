@@ -4,6 +4,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/lufeijun/goTools/ws/frame"
 )
@@ -42,6 +43,10 @@ type goroutineConn struct {
 }
 
 func newGoroutineConn(nc net.Conn, isClient bool) *goroutineConn {
+	if tc, ok := nc.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetReadDeadline(time.Time{})
+	}
 	c := &goroutineConn{
 		id:        nextConnID(),
 		conn:      nc,
@@ -64,15 +69,11 @@ func (c *goroutineConn) LocalAddr() net.Addr        { return c.conn.LocalAddr() 
 func (c *goroutineConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
-		close(c.closeChan)
-
-		closeFrame := frame.NewCloseFrame(1000, "")
-		closeFrame.Masked = c.isClient
-		if c.isClient {
-			closeFrame.MaskKey = frame.GenerateMaskKey()
+		select {
+		case c.writeChan <- Message{Type: frame.OpcodeClose, Status: 1000}:
+		default:
 		}
-		frame.WriteFrame(c.conn, closeFrame)
-
+		close(c.closeChan)
 		err = c.conn.Close()
 	})
 	return err
@@ -99,12 +100,10 @@ func (c *goroutineConn) readLoop() {
 
 		switch f.Opcode {
 		case frame.OpcodePing:
-			pong := frame.NewPongFrame(f.Payload)
-			pong.Masked = c.isClient
-			if c.isClient {
-				pong.MaskKey = frame.GenerateMaskKey()
+			select {
+			case c.writeChan <- Message{Type: frame.OpcodePong, Data: f.Payload}:
+			default:
 			}
-			frame.WriteFrame(c.conn, pong)
 			select {
 			case c.readChan <- msg:
 			case <-c.closeChan:
@@ -112,12 +111,10 @@ func (c *goroutineConn) readLoop() {
 			}
 
 		case frame.OpcodeClose:
-			closeFrame := frame.NewCloseFrame(msg.Status, "")
-			closeFrame.Masked = c.isClient
-			if c.isClient {
-				closeFrame.MaskKey = frame.GenerateMaskKey()
+			select {
+			case c.writeChan <- Message{Type: frame.OpcodeClose, Status: msg.Status}:
+			default:
 			}
-			frame.WriteFrame(c.conn, closeFrame)
 			select {
 			case c.readChan <- msg:
 			case <-c.closeChan:

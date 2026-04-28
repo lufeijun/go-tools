@@ -18,13 +18,13 @@ type ClientConfig struct {
 }
 
 func defaultClientConfig(cfg ClientConfig) ClientConfig {
-	if cfg.PingInterval == 0 {
+	if cfg.PingInterval == 0 || cfg.PingInterval < time.Second {
 		cfg.PingInterval = 30 * time.Second
 	}
-	if cfg.PongTimeout == 0 {
+	if cfg.PongTimeout == 0 || cfg.PongTimeout < time.Second {
 		cfg.PongTimeout = 60 * time.Second
 	}
-	if cfg.ReconnectInterval == 0 {
+	if cfg.ReconnectInterval == 0 || cfg.ReconnectInterval < time.Second {
 		cfg.ReconnectInterval = 5 * time.Second
 	}
 	if cfg.MaxReconnect == 0 {
