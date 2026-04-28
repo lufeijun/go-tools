@@ -9,6 +9,7 @@ import (
 type Opcode = frame.Opcode
 type Message = conn.Message
 type State = session.State
+type Session = session.Session
 type Conn = conn.Conn
 
 const (

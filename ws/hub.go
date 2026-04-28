@@ -2,16 +2,15 @@ package ws
 
 import (
 	"github.com/lufeijun/goTools/ws/internal/conn"
-	"github.com/lufeijun/goTools/ws/internal/session"
 )
 
 type Hub struct {
-	conns      map[uint64]*session.Session
-	register   chan *session.Session
+	conns      map[uint64]*Session
+	register   chan *Session
 	unregister chan uint64
 	broadcast  chan conn.Message
 	getReq     chan uint64
-	getResp    chan *session.Session
+	getResp    chan *Session
 	countReq   chan struct{}
 	countResp  chan int
 	stopChan   chan struct{}
@@ -19,12 +18,12 @@ type Hub struct {
 
 func NewHub() *Hub {
 	return &Hub{
-		conns:      make(map[uint64]*session.Session),
-		register:   make(chan *session.Session, 64),
+		conns:      make(map[uint64]*Session),
+		register:   make(chan *Session, 64),
 		unregister: make(chan uint64, 64),
 		broadcast:  make(chan conn.Message, 64),
 		getReq:     make(chan uint64),
-		getResp:    make(chan *session.Session, 1),
+		getResp:    make(chan *Session, 1),
 		countReq:   make(chan struct{}),
 		countResp:  make(chan int, 1),
 		stopChan:   make(chan struct{}),
@@ -65,7 +64,7 @@ func (h *Hub) Run() {
 	}
 }
 
-func (h *Hub) Register(s *session.Session)  { h.register <- s }
+func (h *Hub) Register(s *Session)  { h.register <- s }
 func (h *Hub) Unregister(id uint64)         { h.unregister <- id }
 func (h *Hub) Broadcast(msg conn.Message)   { h.broadcast <- msg }
 
@@ -77,7 +76,7 @@ func (h *Hub) Send(id uint64, msg conn.Message) {
 	}
 }
 
-func (h *Hub) Get(id uint64) *session.Session {
+func (h *Hub) Get(id uint64) *Session {
 	h.getReq <- id
 	return <-h.getResp
 }

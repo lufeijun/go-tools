@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/lufeijun/goTools/ws/internal/session"
 )
 
 // waitForText reads from a client's ReadChan, skipping non-text frames,
@@ -39,7 +37,7 @@ func TestIntegration_EchoServer(t *testing.T) {
 	// Echo handler: read from session, write back same message (text/binary only)
 	go func() {
 		for sess := range srv.ConnChan() {
-			go func(s *session.Session) {
+			go func(s *Session) {
 				for msg := range s.ReadChan() {
 					if msg.Type == OpcodeText || msg.Type == OpcodeBinary {
 						s.WriteChan() <- msg

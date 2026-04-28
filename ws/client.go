@@ -35,7 +35,7 @@ func defaultClientConfig(cfg ClientConfig) ClientConfig {
 
 type Client struct {
 	config  ClientConfig
-	session *session.Session
+	session *Session
 	headers http.Header
 }
 

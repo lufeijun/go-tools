@@ -43,7 +43,7 @@ type Server struct {
 	config   ServerConfig
 	hub      *Hub
 	listener net.Listener
-	connChan chan *session.Session
+	connChan chan *Session
 	server   *http.Server
 }
 
@@ -52,12 +52,12 @@ func NewServer(cfg ServerConfig) *Server {
 	return &Server{
 		config:   cfg,
 		hub:      NewHub(),
-		connChan: make(chan *session.Session, 64),
+		connChan: make(chan *Session, 64),
 	}
 }
 
 func (s *Server) Hub() *Hub                        { return s.hub }
-func (s *Server) ConnChan() <-chan *session.Session { return s.connChan }
+func (s *Server) ConnChan() <-chan *Session { return s.connChan }
 func (s *Server) Listener() net.Listener            { return s.listener }
 
 func (s *Server) ListenAndServe() error {

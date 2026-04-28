@@ -9,6 +9,9 @@ import (
 	"github.com/lufeijun/goTools/ws/internal/session"
 )
 
+// newTestSession creates a Session for testing using internal package access.
+// This is only used within the ws package tests; external users use *ws.Session.
+
 type mockHubConn struct {
 	readChan  chan conn.Message
 	writeChan chan conn.Message
