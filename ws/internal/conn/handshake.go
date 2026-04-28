@@ -105,24 +105,23 @@ func ClientHandshake(rawURL string, headers http.Header) (Conn, error) {
 	secKey := generateClientSecKey()
 	acceptKey := computeAcceptKey(secKey)
 
-	req := "GET " + u.RequestURI() + " HTTP/1.1\r\n" +
-		"Host: " + u.Host + "\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Key: " + secKey + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n"
+	var req strings.Builder
+	req.WriteString("GET " + u.RequestURI() + " HTTP/1.1\r\n")
+	req.WriteString("Host: " + u.Host + "\r\n")
+	req.WriteString("Upgrade: websocket\r\n")
+	req.WriteString("Connection: Upgrade\r\n")
+	req.WriteString("Sec-WebSocket-Key: " + secKey + "\r\n")
+	req.WriteString("Sec-WebSocket-Version: 13\r\n")
 
-	if headers != nil {
-		for k, vs := range headers {
-			for _, v := range vs {
-				req += k + ": " + v + "\r\n"
-			}
+	for k, vs := range headers {
+		for _, v := range vs {
+			req.WriteString(k + ": " + v + "\r\n")
 		}
 	}
 
-	req += "\r\n"
+	req.WriteString("\r\n")
 
-	if _, err := netConn.Write([]byte(req)); err != nil {
+	if _, err := netConn.Write([]byte(req.String())); err != nil {
 		netConn.Close()
 		return nil, err
 	}

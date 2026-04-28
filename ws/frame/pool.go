@@ -8,11 +8,11 @@ const (
 )
 
 var smallBufPool = sync.Pool{
-	New: func() interface{} { return make([]byte, smallBufSize) },
+	New: func() any { return make([]byte, smallBufSize) },
 }
 
 var defaultBufPool = sync.Pool{
-	New: func() interface{} { return make([]byte, defaultBufSize) },
+	New: func() any { return make([]byte, defaultBufSize) },
 }
 
 func GetBuf(size int) []byte {

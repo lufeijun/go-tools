@@ -162,7 +162,7 @@ func TestIntegration_MaxConnections(t *testing.T) {
 
 	// Connect exactly MaxConnections clients — these should succeed
 	var clients []*Client
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		c := NewClient(ClientConfig{
 			URL:          "ws://" + addr + "/",
 			PingInterval: 30 * time.Second,
