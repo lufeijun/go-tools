@@ -2,6 +2,9 @@ package conn
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,4 +137,55 @@ func TestGoroutineConn_IDIncrement(t *testing.T) {
 	client2.Close()
 	conn1.Close()
 	conn2.Close()
+}
+
+func TestServerHandshake(t *testing.T) {
+	done := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := ServerHandshake(w, r)
+		if err != nil {
+			t.Errorf("ServerHandshake error: %v", err)
+			return
+		}
+		defer c.Close()
+
+		msg := <-c.ReadChan()
+		if string(msg.Data) != "hello" {
+			t.Errorf("got %q, want %q", string(msg.Data), "hello")
+		}
+		c.WriteChan() <- Message{Type: frame.OpcodeText, Data: []byte("world")}
+		<-done
+	})
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	c, err := ClientHandshake(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	c.WriteChan() <- Message{Type: frame.OpcodeText, Data: []byte("hello")}
+
+	select {
+	case msg := <-c.ReadChan():
+		if string(msg.Data) != "world" {
+			t.Errorf("got %q, want %q", string(msg.Data), "world")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+	close(done)
+}
+
+func TestServerHandshake_InvalidRequest(t *testing.T) {
+	req := httptest.NewRequest("GET", "/ws", nil)
+	w := httptest.NewRecorder()
+
+	_, err := ServerHandshake(w, req)
+	if err == nil {
+		t.Error("expected error for invalid handshake")
+	}
 }
