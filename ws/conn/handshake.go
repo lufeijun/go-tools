@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"net"
@@ -71,23 +72,30 @@ func ClientHandshake(rawURL string, headers http.Header) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	useTLS := false
 	switch u.Scheme {
 	case "ws":
 		u.Scheme = "tcp"
 	case "wss":
-		u.Scheme = "tls"
+		u.Scheme = "tcp"
+		useTLS = true
 	default:
 		return nil, errors.New("invalid scheme: use ws:// or wss://")
 	}
 	host := u.Host
 	if !strings.Contains(host, ":") {
-		if u.Scheme == "tcp" {
-			host += ":80"
-		} else {
+		if useTLS {
 			host += ":443"
+		} else {
+			host += ":80"
 		}
 	}
-	netConn, err := net.Dial(u.Scheme, host)
+	var netConn net.Conn
+	if useTLS {
+		netConn, err = tls.Dial("tcp", host, nil)
+	} else {
+		netConn, err = net.Dial("tcp", host)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +147,8 @@ func computeAcceptKey(secKey string) string {
 
 func generateClientSecKey() string {
 	key := make([]byte, 16)
-	rand.Read(key)
+	if _, err := rand.Read(key); err != nil {
+		panic("handshake: failed to generate random key: " + err.Error())
+	}
 	return base64.StdEncoding.EncodeToString(key)
 }

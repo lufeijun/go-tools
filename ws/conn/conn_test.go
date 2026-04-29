@@ -2,6 +2,7 @@ package conn
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"net/http/httptest"
 	"testing"
@@ -16,15 +17,36 @@ func TestNetConn_ReadWrite(t *testing.T) {
 	c := NewNetConn(server, false, 1)
 	defer c.Close()
 
-	// Write from client side
-	go client.Write([]byte("hello"))
+	// Test Write: write from conn, read on client side
+	go func() {
+		bb := buf.NewByteBuf(64)
+		defer bb.Release()
+		bb.Write([]byte("hello"))
+		if err := c.Write(bb); err != nil {
+			t.Errorf("write error: %v", err)
+		}
+	}()
+
+	got := make([]byte, 5)
+	_, err := io.ReadFull(client, got)
+	if err != nil {
+		t.Fatalf("client read error: %v", err)
+	}
+	if !bytes.Equal(got, []byte("hello")) {
+		t.Errorf("client read = %q, want hello", got)
+	}
+
+	// Test Read: write from client side, read on conn
+	go client.Write([]byte("world"))
 
 	bb := buf.NewByteBuf(64)
 	defer bb.Release()
 
-	c.Read(bb)
-	if !bytes.Equal(bb.ReadAll(), []byte("hello")) {
-		t.Errorf("read = %q, want hello", bb.ReadAll())
+	if err := c.Read(bb); err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+	if !bytes.Equal(bb.ReadAll(), []byte("world")) {
+		t.Errorf("read = %q, want world", bb.ReadAll())
 	}
 }
 
@@ -54,6 +76,14 @@ func TestNetConn_IsClient(t *testing.T) {
 	sc := NewNetConn(server, false, 1)
 	if sc.IsClient() {
 		t.Error("server conn should not be client")
+	}
+
+	_, client := net.Pipe()
+	defer client.Close()
+
+	cc := NewNetConn(client, true, 2)
+	if !cc.IsClient() {
+		t.Error("client conn should be client")
 	}
 }
 
