@@ -1,13 +1,18 @@
-package ws
+package ws_test
 
 import (
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/lufeijun/goTools/ws"
+	"github.com/lufeijun/goTools/ws/client"
+	"github.com/lufeijun/goTools/ws/server"
 )
 
 func TestWSError_Error(t *testing.T) {
-	e := &WSError{
-		Code:    ErrCodeProtocolError,
+	e := &ws.WSError{
+		Code:    ws.ErrCodeProtocolError,
 		Message: "invalid opcode",
 		ConnID:  42,
 	}
@@ -19,8 +24,8 @@ func TestWSError_Error(t *testing.T) {
 
 func TestWSError_Unwrap(t *testing.T) {
 	cause := errors.New("underlying io error")
-	e := &WSError{
-		Code:    ErrCodeReadTimeout,
+	e := &ws.WSError{
+		Code:    ws.ErrCodeReadTimeout,
 		Message: "read timeout",
 		Cause:   cause,
 	}
@@ -30,7 +35,7 @@ func TestWSError_Unwrap(t *testing.T) {
 }
 
 func TestWSError_WithConnID(t *testing.T) {
-	e := &WSError{Code: ErrCodeInternalError, Message: "fail"}
+	e := &ws.WSError{Code: ws.ErrCodeInternalError, Message: "fail"}
 	e2 := e.WithConnID(99)
 	if e2.ConnID != 99 {
 		t.Errorf("ConnID = %d, want 99", e2.ConnID)
@@ -41,7 +46,7 @@ func TestWSError_WithConnID(t *testing.T) {
 }
 
 func TestDefaultConfig(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := ws.DefaultConfig()
 	if cfg.ReadBufferSize != 4096 {
 		t.Errorf("ReadBufferSize = %d, want 4096", cfg.ReadBufferSize)
 	}
@@ -62,5 +67,39 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.MaxFrameSize != 64*1024*1024 {
 		t.Errorf("MaxFrameSize = %d, want 64MB", cfg.MaxFrameSize)
+	}
+}
+
+func TestIntegration_ServerStartStop(t *testing.T) {
+	srv := server.NewServer(ws.Config{
+		Addr:         "127.0.0.1:0",
+		PingInterval: 30 * time.Second,
+		PongTimeout:  60 * time.Second,
+	})
+
+	go srv.Start()
+	time.Sleep(100 * time.Millisecond)
+
+	addr := srv.Listener().Addr().String()
+	if addr == "" {
+		t.Fatal("server did not bind to an address")
+	}
+
+	if err := srv.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegration_ClientConfig(t *testing.T) {
+	c := client.NewClient(ws.Config{
+		Addr:              "ws://localhost:8080/",
+		PingInterval:      30 * time.Second,
+		PongTimeout:       60 * time.Second,
+		ReconnectInterval: 5 * time.Second,
+		MaxReconnect:      5,
+	})
+
+	if c.Config().PingInterval != 30*time.Second {
+		t.Errorf("PingInterval = %v, want 30s", c.Config().PingInterval)
 	}
 }
