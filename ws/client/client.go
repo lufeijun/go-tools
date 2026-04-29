@@ -1,8 +1,11 @@
 package client
 
 import (
+	"net"
+
 	"github.com/lufeijun/goTools/ws"
 	"github.com/lufeijun/goTools/ws/conn"
+	"github.com/lufeijun/goTools/ws/frame"
 	"github.com/lufeijun/goTools/ws/session"
 )
 
@@ -89,8 +92,40 @@ func (c *defaultClient) Connect() error {
 	sess.SetState(session.StateConnected)
 	hb.Start(sess)
 
+	// Add frame codec so handlers can write *Message back as WebSocket frames.
+	wc.Pipeline().AddLast("codec", &conn.FrameCodec{Writer: nc, IsClient: true})
+
+	go c.serveConn(nc)
+
 	c.sess = sess
 	return nil
+}
+
+func (c *defaultClient) serveConn(nc net.Conn) {
+	sess := c.sess
+	if sess == nil {
+		return
+	}
+	defer sess.Close()
+
+	for {
+		f, err := frame.ReadFrame(nc)
+		if err != nil {
+			return
+		}
+
+		switch f.Opcode {
+		case frame.OpcodeText, frame.OpcodeBinary:
+			msg := &conn.Message{Type: byte(f.Opcode), Data: f.Payload}
+			sess.Conn().Pipeline().FireChannelRead(msg)
+
+		case frame.OpcodePing:
+			_ = frame.WriteFrame(nc, frame.NewPongFrame(f.Payload))
+
+		case frame.OpcodeClose:
+			return
+		}
+	}
 }
 
 func (c *defaultClient) Close() error {

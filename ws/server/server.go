@@ -7,6 +7,7 @@ import (
 
 	"github.com/lufeijun/goTools/ws"
 	"github.com/lufeijun/goTools/ws/conn"
+	"github.com/lufeijun/goTools/ws/frame"
 	"github.com/lufeijun/goTools/ws/hub"
 	"github.com/lufeijun/goTools/ws/session"
 )
@@ -18,6 +19,7 @@ type Server interface {
 	Start() error
 	Stop() error
 	Listener() net.Listener
+	OnConnect(fn func(session.Session))
 }
 
 // NewServer creates a Server with the given config.
@@ -44,15 +46,17 @@ func NewServer(cfg ws.Config) Server {
 }
 
 type defaultServer struct {
-	config   ws.Config
-	hub      hub.Hub
-	listener net.Listener
-	server   *http.Server
+	config    ws.Config
+	hub       hub.Hub
+	listener  net.Listener
+	server    *http.Server
+	onConnect func(session.Session)
 }
 
 func (s *defaultServer) Config() ws.Config     { return s.config }
 func (s *defaultServer) Hub() hub.Hub          { return s.hub }
 func (s *defaultServer) Listener() net.Listener { return s.listener }
+func (s *defaultServer) OnConnect(fn func(session.Session)) { s.onConnect = fn }
 
 func (s *defaultServer) Start() error {
 	mux := http.NewServeMux()
@@ -94,8 +98,40 @@ func (s *defaultServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 	s.hub.Register(sess)
 
-	// TODO: start read loop for netConn (V2.1)
-	// For now, the connection is established but no frame processing loop runs
+	// Add frame codec so handlers can write *Message back as WebSocket frames.
+	sess.Conn().Pipeline().AddLast("codec", &conn.FrameCodec{Writer: nc, IsClient: false})
+
+	if s.onConnect != nil {
+		s.onConnect(sess)
+	}
+
+	go s.serveConn(sess, nc)
+}
+
+func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
+	defer func() {
+		sess.Close()
+		s.hub.Unregister(sess.Conn().ID())
+	}()
+
+	for {
+		f, err := frame.ReadFrame(nc)
+		if err != nil {
+			return
+		}
+
+		switch f.Opcode {
+		case frame.OpcodeText, frame.OpcodeBinary:
+			msg := &conn.Message{Type: byte(f.Opcode), Data: f.Payload}
+			sess.Conn().Pipeline().FireChannelRead(msg)
+
+		case frame.OpcodePing:
+			_ = frame.WriteFrame(nc, frame.NewPongFrame(f.Payload))
+
+		case frame.OpcodeClose:
+			return
+		}
+	}
 }
 
 func (s *defaultServer) Stop() error {
