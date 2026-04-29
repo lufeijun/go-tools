@@ -10,51 +10,48 @@ import (
 	"time"
 
 	"github.com/lufeijun/goTools/ws"
+	"github.com/lufeijun/goTools/ws/server"
 )
 
 func main() {
-	srv := ws.NewServer(ws.ServerConfig{
+	cfg := ws.Config{
 		Addr:         ":8080",
 		PingInterval: 30 * time.Second,
 		PongTimeout:  60 * time.Second,
-	})
+	}
 
-	go srv.Hub().Run()
+	srv := server.NewServer(cfg)
 
+	// 每 5 秒打印一次当前连接数
 	go func() {
-		for sess := range srv.ConnChan() {
-			go func(s *ws.Session) {
-				for msg := range s.ReadChan() {
-					if msg.Type == ws.OpcodeText {
-
-						sendtime := time.Now().Format("2006-01-02 15:04:05")
-
-						fmt.Printf("接收时间:%s，recv: %s\n", sendtime, string(msg.Data))
-
-						msg.Data = fmt.Appendf(nil, "服务端: %s", sendtime+": "+string(msg.Data))
-
-						s.WriteChan() <- msg
-					}
-				}
-			}(sess)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			count := srv.Hub().Count()
+			if count > 0 {
+				log.Printf("当前在线连接数: %d\n", count)
+			}
 		}
 	}()
 
+	log.Println("服务端启动，监听 :8080 ...")
 	go func() {
-		for sess := range srv.ConnChan() {
-			srv.Hub().Register(sess)
+		if err := srv.Start(); err != nil {
+			log.Fatal("服务端启动失败:", err)
 		}
 	}()
 
-	log.Println("echo server on :8080")
-	go srv.ListenAndServe()
-
+	// 等待中断信号进行优雅关闭
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5e9)
+	log.Println("正在关闭服务端...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
-	fmt.Println("server stopped")
+	if err := srv.Stop(); err != nil {
+		log.Println("关闭失败:", err)
+	}
+	_ = ctx
+	fmt.Println("服务端已停止")
 }

@@ -1,54 +1,54 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/lufeijun/goTools/ws"
+	"github.com/lufeijun/goTools/ws/client"
+	"github.com/lufeijun/goTools/ws/session"
 )
 
 func main() {
-	client := ws.NewClient(ws.ClientConfig{
-		URL: "ws://localhost:8080/",
-	})
-
-	if err := client.Connect(); err != nil {
-		log.Fatal(err)
+	cfg := ws.Config{
+		Addr:         "ws://localhost:8080/",
+		PingInterval: 30 * time.Second,
+		PongTimeout:  60 * time.Second,
 	}
-	defer client.Close()
 
-	// 接收消息
+	c := client.NewClient(cfg)
+
+	// 在单独的 goroutine 中监听连接状态变化
 	go func() {
-		for msg := range client.ReadChan() {
-			if msg.Type == ws.OpcodeText {
-				fmt.Printf("echo: %s\n", string(msg.Data))
+		sess := c.Session()
+		if sess == nil {
+			return
+		}
+		for st := range sess.StateChan() {
+			switch st {
+			case session.StateConnecting:
+				fmt.Println("[状态] 正在连接...")
+			case session.StateConnected:
+				fmt.Println("[状态] 已连接")
+			case session.StateDisconnected:
+				fmt.Println("[状态] 已断开")
+			case session.StateClosed:
+				fmt.Println("[状态] 连接已关闭")
+				return
 			}
 		}
-		fmt.Println("disconnected")
-		os.Exit(0)
 	}()
 
-	// 监听状态
-	go func() {
-		for state := range client.StateChan() {
-			fmt.Println("state:", state)
-		}
-	}()
+	if err := c.Connect(); err != nil {
+		log.Fatal("连接失败:", err)
+	}
 
-	// 读取终端输入并发送
-	fmt.Println("type message and press enter (ctrl+c to quit):")
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		text := scanner.Text()
-		if text == "" {
-			continue
-		}
-		sendtime := time.Now().Format("2006-01-02 15:04:05")
-		fmt.Println("发送时间", sendtime)
-		text = sendtime + ": " + text
-		client.Send(ws.Message{Type: ws.OpcodeText, Data: []byte(text)})
+	fmt.Println("已连接到服务端，按 Ctrl+C 退出")
+
+	// 保持运行，让心跳保活机制持续工作
+	// V2.1 将支持通过 Pipeline 发送和接收消息
+	for {
+		time.Sleep(1 * time.Second)
 	}
 }

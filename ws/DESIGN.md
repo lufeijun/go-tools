@@ -1,354 +1,574 @@
-# ws — Go WebSocket 库技术说明
+# ws v2 — Go WebSocket 库技术设计文档
 
 ## 1. 项目概览
 
-`ws` 是一个从零实现 RFC 6455 WebSocket 协议的 Go 语言库，不依赖任何第三方 WebSocket 库。提供服务端和客户端双端能力，以 Channel 为核心 API 风格，内置心跳保活、自动重连、状态管理、连接管理中心（Hub）等生产级特性。
+`ws` 是一个从零实现 RFC 6455 WebSocket 协议的 Go 语言库，v2 版本在 v1 功能完整性基础上全面重构为高并发架构，目标支撑单机 **十万到百万级** WebSocket 连接。
 
-设计目标：第一版聚焦功能完整性，同时为单机百万级连接预留架构演进路径。
+### 核心决策
 
-## 2. 分层架构
+| 项 | v1 | v2 |
+|---|---|---|
+| 并发模型 | goroutine-per-conn（2-3 goroutine/连接） | 跨平台事件驱动（epoll/kqueue），连接不绑定常驻 goroutine |
+| API 风格 | Channel 式（`ReadChan()` / `WriteChan()`） | Pipeline + Handler 链（Netty 风格） |
+| 包可见性 | `internal` 隐藏实现细节 | 全部公开，接口隔离实现 |
+| 缓冲区 | `sync.Pool` 两级复用 `[]byte` | 引用计数 ByteBuf，支持零拷贝、池化、读写指针分离 |
+| 心跳 | per-conn ticker goroutine | 接口化，`perConnHeartbeater` 可替换为时间轮 |
+| Hub | 单 goroutine + channel | 分片锁（sharded lock），32 个 `sync.RWMutex` |
+| 兼容性 | — | 不保证向后兼容，全新 API |
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   用户 API 层                        │
-│            Client                    Server          │
-├─────────────────────────────────────────────────────┤
-│                   会话层 (session)                   │
-│        State · Heartbeater · Reconnector            │
-├─────────────────────────────────────────────────────┤
-│                   连接层 (conn)                      │
-│     Conn 接口 · goroutineConn · Handshake           │
-├─────────────────────────────────────────────────────┤
-│                   协议层 (frame)                     │
-│      Frame · ReadFrame · WriteFrame · Mask · Pool   │
-└─────────────────────────────────────────────────────┘
-```
+### 设计原则
 
-每一层只依赖下一层，不跨层调用。这种分层的核心价值在于：**每一层可以独立替换实现而不影响上下层**。例如 V2 将 goroutineConn 替换为基于 epoll 的实现时，协议层和会话层代码无需任何改动。
+1. **面向接口编程** — 每一层只依赖下层接口，不依赖具体实现
+2. **借鉴 Netty，适配 Go** — 引入 Pipeline/Handler/ByteBuf/Reactor 模型，但用 Go 协程替代 Java NIO 线程模型
+3. **跨平台事件驱动** — Linux(epoll)、macOS/FreeBSD(kqueue)、Windows(IOCP 预留) 统一抽象
+4. **零 goroutine 空闲开销** — 百万连接下，无数据时 goroutine 数量 ≈ EventLoop 线程数（CPU 核数级别）
 
-## 3. 协议层 — frame 包
+---
 
-协议层是唯一对外公开的子包（`ws/frame`），因为帧解析能力有独立使用价值——用户可能只需要解析 WebSocket 帧而不需要连接管理。
+## 2. 架构概览
 
-### 3.1 帧格式
-
-严格遵循 RFC 6455 Section 5.2 定义的数据帧格式：
+### 包结构
 
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-------+-+-------------+-------------------------------+
-|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
-|I|S|S|S|  (4)  |A|     (7)     |            (16/64)            |
-|N|V|V|V|       |S|             |                               |
-+-+-+-+-+-------+-+-------------+-------------------------------+
-|     Extended payload length continued, if payload len == 127  |
-+-------------------------------+-------------------------------+
-|                               |Masking-key, if MASK set to 1  |
-+-------------------------------+-------------------------------+
-| Masking-key (continued)       |          Payload Data         |
-+-------------------------------- - - - - - - - - - - - - - - - +
+ws/
+├── eventloop/          # 跨平台事件驱动层
+│   ├── eventloop.go         # EventLoop / Poller / EventHandler 接口
+│   ├── epoll_linux.go       # Linux epoll 实现
+│   └── kqueue_bsd.go        # BSD kqueue 实现
+│
+├── buf/                # 引用计数 ByteBuf
+│   ├── bytebuf.go           # ByteBuf 接口 + 默认实现
+│   └── pool.go              # ByteBuf 对象池
+│
+├── frame/              # 协议层（公有，可独立使用）
+│   ├── frame.go             # Frame 结构、ReadFrame、WriteFrame
+│   ├── mask.go              # 掩码处理
+│   └── frame_test.go        # v1 测试保留
+│
+├── pipeline/           # 处理器链（Netty 风格）
+│   ├── handler.go           # ChannelHandler / InboundHandler / OutboundHandler / Context 接口
+│   └── pipeline.go          # ChannelPipeline 实现
+│
+├── conn/               # 连接层
+│   ├── conn.go              # Conn / EventDrivenConn 接口
+│   ├── netconn.go           # 标准 net.Conn 实现
+│   ├── epollconn.go         # 事件驱动 Conn 实现（V2.1 完善）
+│   └── handshake.go         # RFC 6455 握手
+│
+├── session/            # 会话层
+│   ├── session.go           # Session 接口 + 实现
+│   ├── heartbeat.go         # Heartbeater 接口 + 实现
+│   └── reconnect.go         # Reconnector 接口 + 实现
+│
+├── hub/                # 连接管理中心
+│   └── hub.go               # Hub 接口 + 分片锁实现
+│
+├── server/             # 服务端 API
+│   └── server.go            # Server + Bootstrap
+│
+├── client/             # 客户端 API
+│   └── client.go            # Client + Bootstrap
+│
+└── ws.go               # 根包：WSError、Config、DefaultConfig
 ```
 
-`Frame` 结构体直接映射上述格式：
+### 分层关系
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        用户代码                              │
+│                  server.NewServer / client.NewClient        │
+├─────────────────────────────────────────────────────────────┤
+│                      会话层 (session)                         │
+│         Session 接口 · State · Heartbeater · Reconnector     │
+├─────────────────────────────────────────────────────────────┤
+│                      处理器链 (pipeline)                      │
+│         ChannelPipeline · InboundHandler · OutboundHandler   │
+├─────────────────────────────────────────────────────────────┤
+│                      连接层 (conn)                            │
+│         Conn 接口 · netConn · epollConn · Handshake          │
+├─────────────────────────────────────────────────────────────┤
+│                      事件驱动 (eventloop)                     │
+│         EventLoop · Poller · epollPoller · kqueuePoller      │
+├─────────────────────────────────────────────────────────────┤
+│              协议层 (frame) + 缓冲区 (buf)                    │
+│         Frame · ReadFrame · WriteFrame · ByteBuf · Pool      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**依赖规则：上层只能依赖下层接口，不能跨层调用，不能反向依赖。** 例如 `session` 依赖 `conn.Conn` 接口和 `pipeline.ChannelPipeline` 接口，但不知道 `netConn` 或 `epollConn` 的存在。
+
+---
+
+## 3. 核心接口定义
+
+### 3.1 错误处理层（ws 根包）
+
+v2 引入统一的 `WSError` 错误体系，替代 v1 的 `CloseError`。
 
 ```go
-type Frame struct {
-    FIN     bool        // 是否为最后一个分片
-    RSV1    bool        // 扩展预留
-    RSV2    bool
-    RSV3    bool
-    Opcode  Opcode      // 操作码：Text(0x1) Binary(0x2) Close(0x8) Ping(0x9) Pong(0xA)
-    Masked  bool        // 是否掩码
-    MaskKey [4]byte     // 掩码密钥
-    Payload []byte      // 载荷数据
+type WSError struct {
+    Code    int      // 错误码：协议层(1xxx) / 网络层(2xxx) / 应用层(3xxx)
+    Message string   // 可读错误描述
+    Cause   error    // 底层错误（支持 errors.Is / errors.As 链）
+    ConnID  uint64   // 关联连接 ID，0 表示全局错误
 }
 ```
 
-### 3.2 WriteFrame — 帧序列化
+预定义错误码：
 
-`WriteFrame` 将 Frame 结构体序列化为二进制格式写入 `io.Writer`。处理三种载荷长度模式：
+| 错误码 | 含义 |
+|---|---|
+| 1002 | 协议格式错误 |
+| 1003 | 不支持的数据类型 |
+| 1007 | 无效的帧格式 |
+| 1008 | 策略违规 |
+| 1009 | 消息过大 |
+| 1011 | 内部错误 |
+| 2001 | 网络读超时 |
+| 2002 | 网络写超时 |
+| 2003 | 连接重置 |
+| 3001 | Hub 连接数超限 |
 
-| 载荷长度 | 编码方式 | 字段值 |
-|---|---|---|
-| 0–125 | 直接编码到 7 位 | `payloadLen` |
-| 126–65535 | 7 位字段填 126，后跟 2 字节大端 uint16 | `0x7E` + 16bit |
-| > 65535 | 7 位字段填 127，后跟 8 字节大端 uint64 | `0x7F` + 64bit |
+**Pipeline 错误传播：** 任何 Handler 中产生的错误通过 `ctx.FireExceptionCaught(err)` 传播到 Pipeline 链。默认处理逻辑记录日志后关闭连接，用户可自定义 `ExceptionHandler` 替换。
 
-掩码处理：如果 `Masked=true`，在帧头后追加 4 字节 MaskKey，载荷做 XOR 掩码后写入。
+### 3.2 eventloop 层
 
-### 3.3 ReadFrame — 帧解析与分片重组
+```go
+// EventHandler 是事件回调接口，由 conn 层实现
+type EventHandler interface {
+    OnEvent(fd int, events uint32)
+}
 
-`ReadFrame` 从 `io.Reader` 读取并解析一个完整的 WebSocket 消息。核心逻辑：
+// EventLoop 是事件循环抽象，每个 EventLoop 绑定一个 goroutine
+type EventLoop interface {
+    Register(fd int, handler EventHandler) error
+    Deregister(fd int) error
+    Wake()
+    Run() error
+    Stop() error
+}
 
-1. 读取 2 字节帧头，解析 FIN/RSV/Opcode/Masked/PayloadLen
-2. 根据 PayloadLen 读取扩展长度（16bit 或 64bit）
-3. 如果 Masked，读取 4 字节 MaskKey
-4. 读取载荷，如果 Masked 则去掩码
-5. **分片重组**：如果 FIN=false，递归读取后续 continuation 帧，拼接 Payload，直到收到 FIN=true 的帧
-
-分片重组的设计决策：对上层透明——调用者始终收到完整的、已重组的消息，不需要关心底层是否分片。这是 V1 的简化处理，代价是大量分片帧会占用读循环直到全部收到。V2 可考虑提供流式读取模式。
-
-### 3.4 掩码处理
-
-RFC 6455 要求客户端→服务端的帧必须掩码，服务端→客户端的帧不得掩码。掩码算法是简单的 XOR：
-
+// Poller 是底层系统调用抽象
+type Poller interface {
+    Open() error
+    Close() error
+    Add(fd int, events uint32) error
+    Mod(fd int, events uint32) error
+    Del(fd int) error
+    Wait(timeoutMs int) ([]Event, error)
+}
 ```
-masked[i] = payload[i] ^ maskKey[i % 4]
+
+**主从 Reactor 模型：**
+- `MainEventLoop`：1 个，负责 `Accept` 新连接
+- `SubEventLoopGroup`：N 个（默认 N = CPU 核数），每个负责一组连接的 I/O
+- 新连接通过负载均衡（轮询 / 最少连接）分配到某个 SubEventLoop
+
+**循环依赖解决：** `eventloop.EventLoop.Register` 原本需要 `conn.Conn`，但 `conn.EventDrivenConn.SetEventLoop` 又需要 `eventloop.EventLoop`。通过引入 `EventHandler` 接口（conn 实现它，eventloop 只依赖接口）以及 `SetEventLoop(el interface{})` 解除循环依赖。
+
+### 3.3 配置管理（ws 根包）
+
+v2 提供统一的 `Config` 结构体，Server 和 Client 共用：
+
+```go
+type Config struct {
+    Addr              string
+    ReadBufferSize    int           // 默认 4096
+    WriteBufferSize   int           // 默认 4096
+    MaxConnections    int           // 0 表示不限制
+    TCPNoDelay        bool          // 默认 true
+    TCPQuickAck       bool
+    SOReusePort       bool
+    EventLoopWorkers  int           // 默认 runtime.NumCPU()
+    EventLoopStrategy string        // "roundrobin" | "leastconn"
+    BufferPoolSmall   int           // 默认 4096
+    BufferPoolDefault int           // 默认 1024
+    BufferPoolLarge   int           // 默认 256
+    PingInterval      time.Duration // 默认 30s
+    PongTimeout       time.Duration // 默认 60s
+    MaxFrameSize      int           // 默认 64MB
+    EnableCompression bool
+    Headers           http.Header
+    ReconnectInterval time.Duration // 默认 5s
+    MaxReconnect      int           // 默认 5
+}
 ```
 
-`applyMask` 是无状态纯函数，输入输出都是 `[]byte`，不修改原始数据。`GenerateMaskKey` 使用 `crypto/rand` 生成随机 4 字节密钥。
+### 3.4 buf 层 — ByteBuf
 
-### 3.5 两级 Buffer Pool
+```go
+type ByteBuf interface {
+    // 读操作
+    ReadableBytes() int
+    ReadBytes(n int) []byte
+    ReadAll() []byte
+    Skip(n int)
+    Peek(n int) []byte
 
-帧读写频繁分配/释放内存，百万连接下 GC 压力巨大。`pool.go` 使用 `sync.Pool` 实现两级缓冲池：
+    // 写操作
+    WritableBytes() int
+    Write(p []byte) (int, error)
+    WriteByte(b byte) error
+    EnsureWritable(min int)
 
+    // 零拷贝切片（共享底层数组，引用计数 +1）
+    Slice(start, length int) ByteBuf
+
+    // 引用计数
+    Retain() ByteBuf
+    Release()
+    RefCount() int
+
+    // 内部访问
+    Bytes() []byte
+    ReaderIndex() int
+    WriterIndex() int
+    SetReaderIndex(int)
+    SetWriterIndex(int)
+}
+
+type Pool interface {
+    Get(capacity int) ByteBuf
+    Put(ByteBuf)
+}
 ```
-小消息池 (≤512B)  ← 心跳帧、控制帧、短文本
-常规池 (≤4096B)   ← 典型业务消息
-超过 4096B        ← 直接分配，交给 GC
+
+**设计要点：**
+- `Retain()` / `Release()` 管理生命周期，防止 goroutine 间传递时的提前释放
+- `Slice()` 创建共享底层数组的新视图，零拷贝，引用计数 +1
+- 默认实现 `byteBuf` 使用 `sync.Pool` 管理底层 `[]byte`，支持分级回收
+
+**内存泄漏防护：**
+- `Release()` 时 `refCount < 0` 触发 panic（double-free 保护）
+- `Retain()` 时 `refCount <= 1` 触发 panic（在已释放的 buffer 上操作）
+- 所有从 Pool 取出的 ByteBuf `refCount` 初始化为 1
+
+### 3.5 pipeline 层
+
+```go
+type ChannelPipeline interface {
+    AddFirst(name string, handler ChannelHandler) ChannelPipeline
+    AddLast(name string, handler ChannelHandler) ChannelPipeline
+    Remove(name string) ChannelPipeline
+    FireChannelRead(msg interface{})
+    FireChannelWrite(msg interface{})
+    FireChannelActive()
+    FireChannelInactive()
+    FireExceptionCaught(err error)
+}
+
+type InboundHandler interface {
+    ChannelHandler
+    ChannelRead(ctx Context, msg interface{})
+    ChannelActive(ctx Context)
+    ChannelInactive(ctx Context)
+    ExceptionCaught(ctx Context, err error)
+}
+
+type OutboundHandler interface {
+    ChannelHandler
+    Write(ctx Context, msg interface{})
+    Flush(ctx Context)
+}
+
+type Context interface {
+    Pipeline() ChannelPipeline
+    FireChannelRead(msg interface{})
+    FireChannelWrite(msg interface{})
+    FireChannelActive()
+    FireChannelInactive()
+    Write(msg interface{})
+    Flush()
+}
 ```
 
-`GetBuf(size)` 按预估大小选择池子，`PutBuf(buf)` 按 `cap` 归位。V2 可考虑增加大消息池或分级更细。
+**数据流向：**
+```
+Inbound:  eventloop 读数据 → ByteBuf → Head → FrameDecoder → HeartbeatHandler → BizHandler → Tail
+Outbound: BizHandler.Write → FrameEncoder → Head.Write → eventloop 写数据
+```
 
-## 4. 连接层 — internal/conn 包
+- `FireChannelRead` 从 Head 向 Tail 遍历所有 `InboundHandler`
+- `FireChannelWrite` 从 Tail 向 Head 遍历所有 `OutboundHandler`
+- 每个 Handler 通过 `Context` 将事件传递给链中的下一个 Handler
+- `AddFirst` / `AddLast` 在 Pipeline 构建时使用，运行时事件遍历不加锁（Pipeline 构建后不再修改）
 
-连接层管理一条 WebSocket 连接的完整生命周期：握手 → 读写循环 → 关闭。
-
-### 4.1 Conn 接口
+### 3.6 conn 层
 
 ```go
 type Conn interface {
-    ReadChan()  <-chan Message
-    WriteChan() chan<- Message
-    Close() error
-    RemoteAddr() net.Addr
-    LocalAddr()  net.Addr
     ID() uint64
+    Pipeline() pipeline.ChannelPipeline
+    Read(b buf.ByteBuf) error
+    Write(b buf.ByteBuf) error
+    RemoteAddr() net.Addr
+    LocalAddr() net.Addr
+    IsClient() bool
+    Close() error
+    Active() bool
+}
+
+type EventDrivenConn interface {
+    Conn
+    FD() int
+    OnEvent(events uint32)
+    SetEventLoop(el interface{})
 }
 ```
 
-**为什么是接口而不是结构体？** 这是最关键的架构决策之一。V1 的 `goroutineConn` 每个连接占用 2 个 goroutine（读循环 + 写循环），百万连接 = 200 万 goroutine ≈ 4GB 栈内存。V2 将实现 `epollConn`，只在连接活跃时才绑定 goroutine，空闲连接零 goroutine 开销。接口化确保切换实现时用户代码零改动。
+**两种实现：**
+- `netConn`：基于标准 `net.Conn`，开发调试和跨平台 fallback
+- `epollConn`：基于 `eventloop.Poller`，无常驻 goroutine，事件触发时调度（V2.1 完善非阻塞读写）
 
-### 4.2 goroutineConn — V1 默认实现
+**握手协议（RFC 6455）：**
+- `ServerHandshake(w, r)`：验证 GET / Upgrade / Connection / Sec-WebSocket-Key / Version，计算 `Sec-WebSocket-Accept`，通过 `http.Hijacker` 接管连接
+- `ClientHandshake(rawURL, headers)`：支持 `ws://`（TCP 80）和 `wss://`（TLS 443），生成随机 Key，验证服务端 101 响应
 
-```
-                    ┌──────────┐
- net.Conn ──────►  │ readLoop  │ ──► readChan ──► 上层
-                    └──────────┘
-                    ┌──────────┐
- writeChan ──►     │ writeLoop │ ──► net.Conn
-                    └──────────┘
-```
-
-**读循环** (`readLoop`)：
-- 调用 `frame.ReadFrame` 从 `net.Conn` 读取帧
-- 收到 **Ping**：自动构造 Pong 帧写回，同时将 Ping 消息放入 `readChan`（让上层感知心跳）
-- 收到 **Close**：自动回复 Close 帧，将 Close 消息放入 `readChan`，然后退出循环
-- 收到 **Text/Binary**：放入 `readChan`
-- 读到错误或 `closeChan` 关闭时退出，退出时 `close(readChan)` 通知上层
-
-**写循环** (`writeLoop`)：
-- 从 `writeChan` 读取 `Message`，转换为 `Frame`，调用 `frame.WriteFrame` 写入 `net.Conn`
-- 客户端连接（`isClient=true`）自动为每帧生成随机 MaskKey 并掩码
-- 写入失败或 `closeChan` 关闭时退出
-
-**Close**：
-- `sync.Once` 保证只执行一次
-- 先 `close(closeChan)` 通知读写循环退出
-- 尝试发送 Close 帧（优雅关闭），然后关闭底层 `net.Conn`
-
-### 4.3 连接 ID
-
-每个连接分配全局唯一 `uint64` ID，使用 `atomic.AddUint64` 递增。用于 Hub 中的 O(1) 查找，避免使用 string 类型 key 带来的内存和比较开销。
-
-### 4.4 握手协议
-
-**服务端握手** (`ServerHandshake`)：
-1. 验证 HTTP 方法为 GET
-2. 验证 `Upgrade: websocket` 头
-3. 验证 `Connection` 头包含 `upgrade`
-4. 验证 `Sec-WebSocket-Key` 非空
-5. 验证 `Sec-WebSocket-Version: 13`
-6. 计算 `Sec-WebSocket-Accept`：`base64(sha1(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`
-7. 通过 `http.Hijacker` 接管 TCP 连接
-8. 写入 101 Switching Protocols 响应
-9. 创建 `goroutineConn(isClient=false)`
-
-**客户端握手** (`ClientHandshake`)：
-1. 解析 URL，区分 `ws://`（TCP 80）和 `wss://`（TLS 443）
-2. 建立 TCP 连接
-3. 生成 16 字节随机 `Sec-WebSocket-Key`
-4. 发送 HTTP Upgrade 请求
-5. 验证服务端返回 101 状态码和 `Sec-WebSocket-Accept`
-6. 创建 `goroutineConn(isClient=true)`
-
-## 5. 会话层 — internal/session 包
-
-会话层在连接层之上增加三个横切关注点：状态管理、心跳保活、自动重连。
-
-### 5.1 状态机
-
-```
-Disconnected ──► Connecting ──► Connected
-                                   │
-                                   ▼ (连接断开)
-                              Reconnecting ──► Connecting ──► Connected
-                                   │
-                                   ▼ (重连耗尽)
-                                  Closed
-```
-
-状态变更通过 `StateChan` 异步通知上层，channel 缓冲区为 16，防止状态变更频繁时阻塞。`SetState` 使用 `select + default` 非阻塞写入——如果上层还没消费旧状态，新状态直接覆盖。这是刻意的设计：状态是最新值语义，不是事件队列语义。
-
-### 5.2 心跳保活
-
-`Heartbeater` 接口允许替换心跳实现：
+### 3.7 session 层
 
 ```go
-type Heartbeater interface {
-    Start(c conn.Conn)
-    Stop()
-    SetOnTimeout(fn func())
+type Session interface {
+    Conn() conn.Conn
+    State() State
+    StateChan() <-chan State
+    SetState(State)
+    Close() error
+}
+
+type State int
+const (
+    StateDisconnected State = iota
+    StateConnecting
+    StateConnected
+    StateReconnecting
+    StateClosed
+)
+```
+
+**心跳（Heartbeater）：** `perConnHeartbeater` 使用 `time.Ticker` 定时发送 Ping 帧。V2 设计改为只发 Ping 不消费 ReadChan，避免心跳与用户读消息冲突。Pong 超时检测推迟到 V2.1（用时间轮在 conn 层拦截 Pong）。
+
+**自动重连（Reconnector）：** 客户端断开后按配置间隔重试拨号，达到最大重试次数后进入 `StateClosed`。
+
+### 3.8 hub 层 — 分片锁
+
+```go
+type Hub interface {
+    Register(s session.Session)
+    Unregister(id uint64)
+    Broadcast(msg conn.Message)
+    Send(id uint64, msg conn.Message)
+    Count() int
+    Get(id uint64) session.Session
 }
 ```
 
-V1 实现 `perConnHeartbeater`：每个连接一个独立 goroutine，定时通过 `WriteChan` 发送 Ping 帧。
-
-**关键设计决策：心跳不消费 ReadChan。** `ReadChan` 是用户收消息的唯一通道，如果心跳 goroutine 也从中读取 Pong，会偷走用户的消息。V1 的策略是：心跳只发 Ping，连接死亡时 Ping 写入失败，写循环退出，读循环随后退出，上层通过 ReadChan 关闭感知断连。Pong 超时检测留给 V2 的时间轮实现。
-
-### 5.3 自动重连
-
-`Reconnector` 在连接断开后按配置间隔重试拨号：
-
-- 每次重试先进入 `StateConnecting`，失败后退回 `StateReconnecting`
-- 重连成功后更新 Session 的 `connection`/`readChan`/`writeChan` 字段（同包访问），恢复心跳
-- 达到最大重试次数后进入 `StateClosed`
-
-重连器通过 `dial` 函数注入拨号逻辑，与具体握手实现解耦。
-
-## 6. Hub — 连接管理中心
-
-Hub 是百万连接场景的必备基础设施，提供连接注册/注销/广播/定向发送/查找/计数。
-
-### 6.1 架构：单 goroutine 事件循环
-
-```
-          Register ──┐
-         Unregister ─┤
-          Broadcast ─┤
-            Get ─────┼──► Run() ──► map[uint64]*Session
-           Count ────┤         (唯一访问点)
-            Stop ────┘
-```
-
-**所有 map 操作（包括 Get 和 Count）都通过 channel 驱动，由 `Run()` 中的单个 goroutine 串行执行。** 这是并发安全的核心保证——没有锁，没有 sync.Map，只有一个 goroutine 拥有 map 的唯一访问权。
-
-`Get` 和 `Count` 使用请求-响应 channel 对（`getReq`/`getResp`、`countReq`/`countResp`）实现同步查询：
+v1 的单 goroutine + channel 模式在广播时成为瓶颈。v2 改用**分片锁（sharded lock）**：
 
 ```go
-func (h *Hub) Get(id uint64) *session.Session {
-    h.getReq <- id        // 发送查询请求
-    return <-h.getResp    // 等待查询结果
+type shardedHub struct {
+    shardCount int
+    shards     []*shard
+}
+
+type shard struct {
+    mu    sync.RWMutex
+    conns map[uint64]session.Session
 }
 ```
 
-这种模式比 `sync.RWMutex` 更适合高并发读场景——读请求在 channel 中排队，不会被写操作阻塞，也不会出现读写锁的写饥饿问题。
+- `shardCount` 默认 32，每个 shard 独立 `sync.RWMutex`
+- `Register` / `Unregister`：写锁单个 shard，不影响其他 shard
+- `Get`：读锁单个 shard，O(1)
+- `Count`：遍历所有 shard 读锁求和
+- `Broadcast`：并发遍历所有 shard（每个 shard 一个 goroutine），shard 内对每个 Session 非阻塞写入
 
-### 6.2 广播
+---
 
-广播时遍历 `conns` map，向每个 Session 的 `WriteChan` 非阻塞写入。如果某个连接的 WriteChan 已满（`default` 分支），跳过该连接——宁可丢消息也不让广播 goroutine 阻塞在一个慢连接上。
+## 4. 数据流
 
-## 7. 用户 API 层
+### 4.1 服务端收消息（Inbound）
 
-### 7.1 类型导出
+```
+客户端 TCP 帧
+    │
+    ▼
+[eventloop.Poller.Wait] 检测到 Read 事件
+    │
+    ▼
+[EventLoop] 调度到对应 Conn
+    │
+    ▼
+[conn.Read] 从 fd 读取原始字节到 ByteBuf
+    │
+    ▼
+[pipeline.FireChannelRead] 触发 Inbound 链
+    │
+    ├── [FrameDecoder] ByteBuf → Frame（RFC 6455 解析）
+    │
+    ├── [MaskDecoder] 客户端帧去掩码
+    │
+    ├── [HeartbeatHandler] Ping 自动回 Pong
+    │
+    └── [BizHandler] Frame → Message → 业务逻辑
+```
 
-`types.go` 使用 Go 类型别名将子包类型 re-export 到根包：
+### 4.2 服务端发消息（Outbound）
 
+```
+业务逻辑调用 ctx.Write(Message)
+    │
+    ▼
+[pipeline.FireChannelWrite] 触发 Outbound 链（从尾到头）
+    │
+    ├── [BizHandler] Message → Frame
+    │
+    ├── [MaskEncoder] 服务端→客户端帧加掩码
+    │
+    └── [FrameEncoder] Frame → ByteBuf
+    │
+    ▼
+[HeadContext.Write] 将 ByteBuf 加入 Conn 发送队列
+    │
+    ▼
+[eventloop] 注册 Write 事件，触发 TCP 发送
+    │
+    ▼
+[conn.Write] ByteBuf → fd
+    │
+    ▼
+ByteBuf.Release()  引用计数 -1，归零时回收到 Pool
+```
+
+### 4.3 广播
+
+```
+Hub.Broadcast(Message)
+    │
+    ▼
+[shardedHub] 并发遍历所有 shard（每个 shard 一个 goroutine）
+    │
+    ├── shard[0]: RLock → 遍历 conns → 每个 Session Pipeline 非阻塞写入
+    ├── shard[1]: RLock → ...
+    └── ...
+```
+
+---
+
+## 5. 高性能设计要点
+
+### 5.1 零 goroutine 空闲开销
+
+v1 每个连接 2-3 个 goroutine，百万连接 ≈ 200-300 万 goroutine ≈ 4-6GB 栈内存。
+
+v2 的 epollConn：
+- 连接建立时：0 个专属 goroutine
+- 有数据可读时：EventLoop goroutine 直接处理
+- 需要长时间计算的业务逻辑：通过 Pipeline Handler 提交到业务 goroutine 池
+- **空闲连接零 goroutine 开销**
+
+### 5.2 零拷贝
+
+- eventloop 读数据时直接写入 `ByteBuf`，不经过中间 buffer
+- `FrameDecoder` 解析出的 Payload 通过 `ByteBuf.Slice()` 共享底层数组
+- `FrameEncoder` 序列化时直接写入发送队列的 `ByteBuf`
+- 广播时同一份 `ByteBuf` 通过 `Retain()` 增加引用计数，发送到多个连接后各 `Release()`
+
+### 5.3 内存池化
+
+- `ByteBuf` 使用 `sync.Pool` 分级回收：≤512B / ≤4096B / ≤65536B / 直接分配
+- 帧读写频繁分配/释放内存，百万连接下 GC 压力巨大，池化是必需品
+
+### 5.4 减少系统调用
+
+- `WriteFrame` 合并 header + payload 到一个 `ByteBuf` 后单次 `write()`
+- 建连时默认 `TCP_NODELAY`（关闭 Nagle），避免小包延迟
+- V2 修复了 v1 中 header + payload 两次 Write 导致的 Nagle + Delayed ACK 交互延迟问题
+
+### 5.5 TCP 优化
+
+- `TCP_NODELAY`：默认开启，关闭 Nagle 算法
+- `TCP_QUICKACK`：Linux 可选开启
+- `SO_REUSEPORT`：多进程负载均衡可选开启
+
+### 5.6 背压处理（Backpressure）
+
+**Hub 广播背压：** `Broadcast()` 对慢连接非阻塞写入，写满直接跳过，避免广播 goroutine 阻塞在单个慢连接上。
+
+**Pipeline 层背压：** 每个 Conn 的发送队列设上限，队列满时 `ctx.Write()` 返回错误，业务层可选择丢弃或阻塞。
+
+---
+
+## 6. 跨平台策略
+
+| 平台 | 事件驱动机制 | 实现文件 | 备注 |
+|---|---|---|---|
+| Linux | epoll | `eventloop/epoll_linux.go` | 主力平台，百万连接目标 |
+| macOS / FreeBSD / OpenBSD | kqueue | `eventloop/kqueue_bsd.go` | 开发调试 |
+| Windows | IOCP | 预留接口 | V2.1 实现 |
+| 其他 | 标准 net.Conn | `conn/netconn.go` | fallback，功能完整但性能受限 |
+
+**编译约束：**
 ```go
-type Opcode = frame.Opcode
-type Message = conn.Message
-type State = session.State
-type Conn = conn.Conn
+// eventloop/epoll_linux.go
+//go:build linux
+
+// eventloop/kqueue_bsd.go
+//go:build darwin || freebsd || openbsd
 ```
 
-用户只需 `import "github.com/lufeijun/goTools/ws"`，无需关心内部包路径。类型别名（`=`）而非新类型，确保与子包类型完全等价，可以互相赋值。
+---
 
-### 7.2 错误类型
+## 7. V1 → V2 迁移说明
 
-`CloseError` 复用 WebSocket Close Code 作为错误码，不另建体系：
+v2 **不保证向后兼容**。关键变化：
 
-```go
-type CloseError struct {
-    Code   uint16   // RFC 6455 Close Code
-    Reason string
-    Cause  error    // 底层错误
-}
-```
-
-预定义 6 个标准错误（1002/1003/1007/1008/1009/1011），`WithCause` 方法用于包装底层错误，`Unwrap` 方法支持 `errors.Is`/`errors.As` 错误链。
-
-### 7.3 Server
-
-Server 内嵌 Hub，通过 `http.HandleFunc` 处理 WebSocket 升级请求。请求处理流程：
-
-1. 检查 `MaxConnections` 限制（查询 Hub.Count）
-2. 调用 `ServerHandshake` 完成 WebSocket 握手
-3. 创建 Session，安装 Heartbeater
-4. 设置状态为 Connected，启动心跳
-5. 将 Session 通过 `ConnChan` 推送给上层
-
-`Shutdown` 方法先停止 Hub 事件循环，再调用 `http.Server.Shutdown` 优雅关闭 HTTP 服务。
-
-### 7.4 Client
-
-Client 的 `Connect()` 方法：
-1. 调用 `ClientHandshake` 建立 WebSocket 连接
-2. 创建 Session，安装 Heartbeater
-3. 设置状态为 Connected，启动心跳
-
-`ReadChan`/`WriteChan`/`StateChan` 透传 Session 的对应 channel。`Send` 是 `WriteChan <- msg` 的语法糖。`Close` 委托给 Session 的 Close（停止心跳 + 发送 Close 帧 + 关闭底层连接）。
-
-## 8. 数据流
-
-### 8.1 服务端收消息
-
-```
-客户端 ──TCP──► net.Conn ──► readLoop(ReadFrame) ──► readChan ──► Session.ReadChan ──► 用户
-```
-
-### 8.2 服务端发消息
-
-```
-用户 ──► Session.WriteChan ──► writeChan ──► writeLoop(WriteFrame) ──► net.Conn ──TCP──► 客户端
-```
-
-### 8.3 广播
-
-```
-Hub.Broadcast(msg) ──► broadcast chan ──► Run()遍历conns ──► 各Session.WriteChan ──► 各writeLoop
-```
-
-## 9. 高性能演进路径
-
-V1 的架构约束为百万级连接预留了清晰的演进路线：
-
-| 瓶颈 | V1 实现 | V2 演进 |
+| 变化项 | v1 | v2 |
 |---|---|---|
-| goroutine 开销 | goroutine-per-conn（2/连接） | epoll + goroutine 池，活跃连接才绑定 goroutine |
-| channel 开销 | channel 模型（2/连接） | 新增 zero-channel 回调模式 |
-| 定时器开销 | time.Ticker per conn | 时间轮（time wheel），单 goroutine 管理所有超时 |
-| buffer 内存 | sync.Pool 两级复用 | 分级更细的池 + 大消息池 |
+| import 路径 | 全部 `ws` 根包 | 子包按需 import |
+| API 风格 | Channel（`ReadChan()` / `WriteChan()`） | Pipeline Handler（`ChannelRead(ctx, msg)`） |
+| 接收消息 | `for msg := range sess.ReadChan()` | 实现 `InboundHandler`，注册到 Pipeline |
+| 发送消息 | `sess.WriteChan() <- msg` | `ctx.Write(msg)` 在 Handler 中发送 |
+| 连接管理 | `internal` 包不可扩展 | `conn`、`session`、`hub` 全部公开，接口隔离 |
+| 类型位置 | `ws.Session` 是类型别名 | `session.Session` 是直接类型（包已公开） |
 
-**接口化是演进的关键**：Conn 接口 → V2 新增 epollConn 实现；Heartbeater 接口 → V2 新增 timeWheelHeartbeater 实现。用户代码通过接口交互，切换实现时零改动。
+**迁移示例：**
+```go
+// v1
+for msg := range sess.ReadChan() {
+    sess.WriteChan() <- msg
+}
 
-## 10. 包可见性设计
-
+// v2
+type EchoHandler struct{}
+func (h *EchoHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
+    ctx.Write(msg)
+}
 ```
-ws/frame/          ← 公有包，帧解析可独立使用
-ws/internal/conn/  ← 私有包，连接管理是内部实现
-ws/internal/session/ ← 私有包，会话管理是内部实现
-ws/                ← 根包，用户 API + 类型导出
-```
 
-`frame` 保持公有，因为用户可能只需要帧解析能力（比如自定义连接管理）。`conn` 和 `session` 放入 `internal`，防止用户依赖内部实现细节——这样 V2 替换实现时不会破坏任何外部代码。
+---
+
+## 8. 测试策略
+
+| 层级 | 测试方式 | 目标 |
+|---|---|---|
+| eventloop | mock Poller，测试 EventLoop 调度逻辑 | 事件分发正确 |
+| buf | 单元测试引用计数、Slice、Pool | 无内存泄漏、零拷贝正确 |
+| frame | 单元测试，构造字节序列验证解析/序列化 | RFC 6455 合规（v1 测试保留） |
+| pipeline | mock Handler，测试链式调用 | Inbound/Outbound 顺序正确 |
+| conn | `net.Pipe` 测试 netConn；接口测试 epollConn | 读写、握手正确 |
+| session | mock Conn + Pipeline，测试状态/心跳/重连 | 状态机正确 |
+| hub | mock Session，测试注册/注销/广播 | 分片锁正确 |
+| 集成 | 真实 Server + Client 端到端 | 功能完整 |
+| 压力 | 10万+ 连接监控 goroutine/内存/CPU | 确认性能目标 |
+
+---
+
+## 9. V2 演进路线图
+
+| 阶段 | 内容 | 目标 |
+|---|---|---|
+| V2.0 | 接口化重构 + Pipeline + 事件驱动（epoll/kqueue） | 十万连接 |
+| V2.1 | Windows IOCP + 时间轮心跳 + 非阻塞 syscall 读写 | 跨平台完整 |
+| V2.2 | goroutine 池化（业务计算池 + I/O 池分离） | 五十万连接 |
+| V2.3 | sendfile/splice 零拷贝、SO_REUSEPORT | 百万连接 |
