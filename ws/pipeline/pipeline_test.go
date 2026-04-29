@@ -26,6 +26,7 @@ type recorderOutbound struct {
 
 func (h *recorderOutbound) Write(ctx Context, msg interface{}) {
 	h.writes = append(h.writes, msg)
+	ctx.Write(msg)
 }
 func (h *recorderOutbound) Flush(ctx Context) {}
 
@@ -93,4 +94,16 @@ func TestDefaultPipeline_ActiveInactive(t *testing.T) {
 	if !h1.inactive {
 		t.Error("h1 should be inactive")
 	}
+}
+
+func TestDefaultPipeline_DuplicateName(t *testing.T) {
+	p := NewPipeline()
+	h1 := &recorderInbound{testHandler: testHandler{name: "h1"}}
+	p.AddLast("h1", h1)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for duplicate handler name")
+		}
+	}()
+	p.AddLast("h1", h1)
 }

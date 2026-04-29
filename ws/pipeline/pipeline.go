@@ -84,6 +84,9 @@ func (c *handlerContext) findPrevOutbound() *handlerContext {
 func (p *defaultPipeline) AddFirst(name string, handler ChannelHandler) ChannelPipeline {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if _, exists := p.ctxs[name]; exists {
+		panic("pipeline: duplicate handler name: " + name)
+	}
 	ctx := &handlerContext{pipeline: p, name: name, handler: handler}
 	p.insertAfter(p.head, ctx)
 	p.ctxs[name] = ctx
@@ -93,6 +96,9 @@ func (p *defaultPipeline) AddFirst(name string, handler ChannelHandler) ChannelP
 func (p *defaultPipeline) AddLast(name string, handler ChannelHandler) ChannelPipeline {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if _, exists := p.ctxs[name]; exists {
+		panic("pipeline: duplicate handler name: " + name)
+	}
 	ctx := &handlerContext{pipeline: p, name: name, handler: handler}
 	p.insertBefore(p.tail, ctx)
 	p.ctxs[name] = ctx
@@ -126,16 +132,24 @@ func (p *defaultPipeline) insertBefore(before, ctx *handlerContext) {
 	before.prev = ctx
 }
 
-func (p *defaultPipeline) FireChannelRead(msg interface{}) { p.head.invokeChannelRead(msg) }
+func (p *defaultPipeline) FireChannelRead(msg interface{}) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	p.head.invokeChannelRead(msg)
+}
 func (p *defaultPipeline) FireChannelWrite(msg interface{}) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	for ctx := p.tail.prev; ctx != p.head; ctx = ctx.prev {
-		if h, ok := ctx.handler.(OutboundHandler); ok {
-			h.Write(ctx, msg)
-		}
-	}
+	p.tail.invokeChannelWrite(msg)
 }
-func (p *defaultPipeline) FireChannelActive()  { p.head.invokeChannelActive() }
-func (p *defaultPipeline) FireChannelInactive() { p.head.invokeChannelInactive() }
+func (p *defaultPipeline) FireChannelActive() {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	p.head.invokeChannelActive()
+}
+func (p *defaultPipeline) FireChannelInactive() {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	p.head.invokeChannelInactive()
+}
 func (p *defaultPipeline) FireExceptionCaught(err error) { /* TODO */ }
