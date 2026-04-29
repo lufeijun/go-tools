@@ -15,7 +15,7 @@ func NewPipeline() ChannelPipeline {
 }
 
 type defaultPipeline struct {
-	mu   sync.RWMutex
+	mu   sync.RWMutex // protects ctxs map and linked list during setup; event traversal is lock-free
 	head *handlerContext
 	tail *handlerContext
 	ctxs map[string]*handlerContext
@@ -38,8 +38,6 @@ func (c *handlerContext) Write(msg interface{})              { c.invokeChannelWr
 func (c *handlerContext) Flush()                             {}
 
 func (c *handlerContext) invokeChannelRead(msg interface{}) {
-	c.pipeline.mu.RLock()
-	defer c.pipeline.mu.RUnlock()
 	next := c.findNextInbound()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelRead(next, msg)
@@ -47,8 +45,6 @@ func (c *handlerContext) invokeChannelRead(msg interface{}) {
 }
 
 func (c *handlerContext) invokeChannelWrite(msg interface{}) {
-	c.pipeline.mu.RLock()
-	defer c.pipeline.mu.RUnlock()
 	prev := c.findPrevOutbound()
 	if prev != nil {
 		prev.handler.(OutboundHandler).Write(prev, msg)
@@ -56,8 +52,6 @@ func (c *handlerContext) invokeChannelWrite(msg interface{}) {
 }
 
 func (c *handlerContext) invokeChannelActive() {
-	c.pipeline.mu.RLock()
-	defer c.pipeline.mu.RUnlock()
 	next := c.findNextInbound()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelActive(next)
@@ -65,8 +59,6 @@ func (c *handlerContext) invokeChannelActive() {
 }
 
 func (c *handlerContext) invokeChannelInactive() {
-	c.pipeline.mu.RLock()
-	defer c.pipeline.mu.RUnlock()
 	next := c.findNextInbound()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelInactive(next)
