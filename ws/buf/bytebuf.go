@@ -5,9 +5,10 @@ import (
 	"sync/atomic"
 )
 
-// Pool is a buffer pool that can recycle ByteBuf instances.
+// Pool is a tiered ByteBuf pool.
 type Pool interface {
-	Put(b ByteBuf)
+	Get(capacity int) ByteBuf
+	Put(ByteBuf)
 }
 
 // ByteBuf is a reference-counted byte buffer with separate read/write indexes.
