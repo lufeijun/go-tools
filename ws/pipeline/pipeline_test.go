@@ -15,8 +15,14 @@ func (h *recorderInbound) ChannelRead(ctx Context, msg interface{}) {
 	h.reads = append(h.reads, msg)
 	ctx.FireChannelRead(msg)
 }
-func (h *recorderInbound) ChannelActive(ctx Context)   { h.active = true }
-func (h *recorderInbound) ChannelInactive(ctx Context) { h.inactive = true }
+func (h *recorderInbound) ChannelActive(ctx Context) {
+	h.active = true
+	ctx.FireChannelActive()
+}
+func (h *recorderInbound) ChannelInactive(ctx Context) {
+	h.inactive = true
+	ctx.FireChannelInactive()
+}
 func (h *recorderInbound) ExceptionCaught(ctx Context, err error) {}
 
 type recorderOutbound struct {
@@ -106,4 +112,91 @@ func TestDefaultPipeline_DuplicateName(t *testing.T) {
 		}
 	}()
 	p.AddLast("h1", h1)
+}
+
+func TestDefaultPipeline_AddFirst(t *testing.T) {
+	p := NewPipeline()
+	h1 := &recorderInbound{testHandler: testHandler{name: "h1"}}
+	h2 := &recorderInbound{testHandler: testHandler{name: "h2"}}
+	p.AddLast("h1", h1)
+	p.AddFirst("h2", h2)
+
+	p.FireChannelRead("msg")
+
+	if len(h2.reads) != 1 || h2.reads[0] != "msg" {
+		t.Errorf("h2.reads = %v, want [msg]", h2.reads)
+	}
+	if len(h1.reads) != 1 || h1.reads[0] != "msg" {
+		t.Errorf("h1.reads = %v, want [msg]", h1.reads)
+	}
+}
+
+func TestDefaultPipeline_MixedHandlers(t *testing.T) {
+	p := NewPipeline()
+	in := &recorderInbound{testHandler: testHandler{name: "in"}}
+	out := &recorderOutbound{testHandler: testHandler{name: "out"}}
+	p.AddLast("in", in)
+	p.AddLast("out", out)
+
+	p.FireChannelRead("read-msg")
+	if len(in.reads) != 1 || in.reads[0] != "read-msg" {
+		t.Errorf("in.reads = %v, want [read-msg]", in.reads)
+	}
+	if len(out.writes) != 0 {
+		t.Errorf("out.writes = %v, want empty", out.writes)
+	}
+
+	p.FireChannelWrite("write-msg")
+	if len(out.writes) != 1 || out.writes[0] != "write-msg" {
+		t.Errorf("out.writes = %v, want [write-msg]", out.writes)
+	}
+}
+
+func TestDefaultPipeline_ActiveInactiveChain(t *testing.T) {
+	p := NewPipeline()
+	h1 := &recorderInbound{testHandler: testHandler{name: "h1"}}
+	h2 := &recorderInbound{testHandler: testHandler{name: "h2"}}
+	p.AddLast("h1", h1)
+	p.AddLast("h2", h2)
+
+	p.FireChannelActive()
+	if !h1.active {
+		t.Error("h1 should be active")
+	}
+	if !h2.active {
+		t.Error("h2 should be active")
+	}
+
+	p.FireChannelInactive()
+	if !h1.inactive {
+		t.Error("h1 should be inactive")
+	}
+	if !h2.inactive {
+		t.Error("h2 should be inactive")
+	}
+}
+
+func TestDefaultPipeline_RemoveNonExistent(t *testing.T) {
+	p := NewPipeline()
+	p.Remove("nobody")
+}
+
+func TestDefaultPipeline_NilHandler(t *testing.T) {
+	p := NewPipeline()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for nil handler")
+		}
+	}()
+	p.AddLast("h", nil)
+}
+
+func TestDefaultPipeline_EmptyName(t *testing.T) {
+	p := NewPipeline()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for empty handler name")
+		}
+	}()
+	p.AddLast("", &recorderInbound{testHandler: testHandler{name: "h"}})
 }

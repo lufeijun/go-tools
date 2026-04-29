@@ -22,7 +22,7 @@ type defaultPipeline struct {
 }
 
 type handlerContext struct {
-	pipeline ChannelPipeline
+	pipeline *defaultPipeline
 	name     string
 	handler  ChannelHandler
 	prev     *handlerContext
@@ -32,10 +32,14 @@ type handlerContext struct {
 func (c *handlerContext) Pipeline() ChannelPipeline          { return c.pipeline }
 func (c *handlerContext) FireChannelRead(msg interface{})    { c.invokeChannelRead(msg) }
 func (c *handlerContext) FireChannelWrite(msg interface{})   { c.invokeChannelWrite(msg) }
+func (c *handlerContext) FireChannelActive()                 { c.invokeChannelActive() }
+func (c *handlerContext) FireChannelInactive()               { c.invokeChannelInactive() }
 func (c *handlerContext) Write(msg interface{})              { c.invokeChannelWrite(msg) }
 func (c *handlerContext) Flush()                             {}
 
 func (c *handlerContext) invokeChannelRead(msg interface{}) {
+	c.pipeline.mu.RLock()
+	defer c.pipeline.mu.RUnlock()
 	next := c.findNextInbound()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelRead(next, msg)
@@ -43,6 +47,8 @@ func (c *handlerContext) invokeChannelRead(msg interface{}) {
 }
 
 func (c *handlerContext) invokeChannelWrite(msg interface{}) {
+	c.pipeline.mu.RLock()
+	defer c.pipeline.mu.RUnlock()
 	prev := c.findPrevOutbound()
 	if prev != nil {
 		prev.handler.(OutboundHandler).Write(prev, msg)
@@ -50,6 +56,8 @@ func (c *handlerContext) invokeChannelWrite(msg interface{}) {
 }
 
 func (c *handlerContext) invokeChannelActive() {
+	c.pipeline.mu.RLock()
+	defer c.pipeline.mu.RUnlock()
 	next := c.findNextInbound()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelActive(next)
@@ -57,6 +65,8 @@ func (c *handlerContext) invokeChannelActive() {
 }
 
 func (c *handlerContext) invokeChannelInactive() {
+	c.pipeline.mu.RLock()
+	defer c.pipeline.mu.RUnlock()
 	next := c.findNextInbound()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelInactive(next)
@@ -82,6 +92,12 @@ func (c *handlerContext) findPrevOutbound() *handlerContext {
 }
 
 func (p *defaultPipeline) AddFirst(name string, handler ChannelHandler) ChannelPipeline {
+	if handler == nil {
+		panic("pipeline: handler is nil")
+	}
+	if name == "" {
+		panic("pipeline: handler name is empty")
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, exists := p.ctxs[name]; exists {
@@ -94,6 +110,12 @@ func (p *defaultPipeline) AddFirst(name string, handler ChannelHandler) ChannelP
 }
 
 func (p *defaultPipeline) AddLast(name string, handler ChannelHandler) ChannelPipeline {
+	if handler == nil {
+		panic("pipeline: handler is nil")
+	}
+	if name == "" {
+		panic("pipeline: handler name is empty")
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, exists := p.ctxs[name]; exists {
@@ -133,23 +155,19 @@ func (p *defaultPipeline) insertBefore(before, ctx *handlerContext) {
 }
 
 func (p *defaultPipeline) FireChannelRead(msg interface{}) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
 	p.head.invokeChannelRead(msg)
 }
+
 func (p *defaultPipeline) FireChannelWrite(msg interface{}) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
 	p.tail.invokeChannelWrite(msg)
 }
+
 func (p *defaultPipeline) FireChannelActive() {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
 	p.head.invokeChannelActive()
 }
+
 func (p *defaultPipeline) FireChannelInactive() {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
 	p.head.invokeChannelInactive()
 }
+
 func (p *defaultPipeline) FireExceptionCaught(err error) { /* TODO */ }

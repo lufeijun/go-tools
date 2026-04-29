@@ -38,6 +38,8 @@ type Context interface {
 	Pipeline() ChannelPipeline
 	FireChannelRead(msg interface{})
 	FireChannelWrite(msg interface{})
+	FireChannelActive()
+	FireChannelInactive()
 	Write(msg interface{})
 	Flush()
 }
