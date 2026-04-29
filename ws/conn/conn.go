@@ -1,12 +1,15 @@
 package conn
 
 import (
+	"errors"
 	"net"
 	"sync/atomic"
 
 	"github.com/lufeijun/goTools/ws/buf"
 	"github.com/lufeijun/goTools/ws/pipeline"
 )
+
+var ErrConnClosed = errors.New("conn: connection closed")
 
 // Message is the high-level message structure.
 type Message struct {

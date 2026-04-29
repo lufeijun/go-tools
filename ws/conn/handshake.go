@@ -23,11 +23,11 @@ func ServerHandshake(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return nil, errInvalidHandshake
 	}
-	if r.Header.Get("Upgrade") != "websocket" {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "Upgrade required", http.StatusBadRequest)
 		return nil, errInvalidHandshake
 	}
-	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+	if !hasConnectionUpgrade(r.Header.Get("Connection")) {
 		http.Error(w, "Connection upgrade required", http.StatusBadRequest)
 		return nil, errInvalidHandshake
 	}
@@ -50,6 +50,10 @@ func ServerHandshake(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
 	netConn, bw, err := hj.Hijack()
 	if err != nil {
 		return nil, err
+	}
+	// If the bufio.Reader has buffered data, wrap the conn to serve it first.
+	if br := bw.Reader; br.Buffered() > 0 {
+		netConn = &drainConn{Conn: netConn, buf: br}
 	}
 	response := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
@@ -99,7 +103,11 @@ func ClientHandshake(rawURL string, headers http.Header) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	secKey := generateClientSecKey()
+	secKey, err := generateClientSecKey()
+	if err != nil {
+		netConn.Close()
+		return nil, err
+	}
 	acceptKey := computeAcceptKey(secKey)
 	var b strings.Builder
 	b.WriteString("GET " + u.RequestURI() + " HTTP/1.1\r\n")
@@ -128,7 +136,7 @@ func ClientHandshake(rawURL string, headers http.Header) (net.Conn, error) {
 		netConn.Close()
 		return nil, errors.New("server returned status " + resp.Status)
 	}
-	if resp.Header.Get("Upgrade") != "websocket" {
+	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
 		netConn.Close()
 		return nil, errInvalidHandshake
 	}
@@ -145,10 +153,32 @@ func computeAcceptKey(secKey string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-func generateClientSecKey() string {
+func generateClientSecKey() (string, error) {
 	key := make([]byte, 16)
 	if _, err := rand.Read(key); err != nil {
-		panic("handshake: failed to generate random key: " + err.Error())
+		return "", err
 	}
-	return base64.StdEncoding.EncodeToString(key)
+	return base64.StdEncoding.EncodeToString(key), nil
+}
+
+func hasConnectionUpgrade(v string) bool {
+	for _, tok := range strings.Split(v, ",") {
+		if strings.EqualFold(strings.TrimSpace(tok), "upgrade") {
+			return true
+		}
+	}
+	return false
+}
+
+// drainConn wraps a net.Conn to serve buffered bytes before reading from the connection.
+type drainConn struct {
+	net.Conn
+	buf *bufio.Reader
+}
+
+func (d *drainConn) Read(p []byte) (int, error) {
+	if d.buf.Buffered() > 0 {
+		return d.buf.Read(p)
+	}
+	return d.Conn.Read(p)
 }

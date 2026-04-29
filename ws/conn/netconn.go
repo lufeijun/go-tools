@@ -1,7 +1,6 @@
 package conn
 
 import (
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -39,7 +38,7 @@ func (c *netConn) Active() bool                  { return atomic.LoadInt32(&c.ac
 
 func (c *netConn) Read(b buf.ByteBuf) error {
 	if !c.Active() {
-		return io.EOF
+		return ErrConnClosed
 	}
 	// Read into a temp buffer then write to ByteBuf
 	tmp := make([]byte, 4096)
@@ -52,10 +51,17 @@ func (c *netConn) Read(b buf.ByteBuf) error {
 
 func (c *netConn) Write(b buf.ByteBuf) error {
 	if !c.Active() {
-		return io.ErrClosedPipe
+		return ErrConnClosed
 	}
-	_, err := c.conn.Write(b.ReadAll())
-	return err
+	data := b.ReadAll()
+	for len(data) > 0 {
+		n, err := c.conn.Write(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 func (c *netConn) Close() error {

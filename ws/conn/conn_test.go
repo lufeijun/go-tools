@@ -95,3 +95,32 @@ func TestServerHandshake_InvalidRequest(t *testing.T) {
 		t.Error("expected error for invalid handshake")
 	}
 }
+
+func TestNetConn_Close(t *testing.T) {
+	_, server := net.Pipe()
+	defer server.Close()
+
+	c := NewNetConn(server, false, 1)
+	if !c.Active() {
+		t.Error("conn should be active")
+	}
+	if err := c.Close(); err != nil {
+		t.Errorf("close error: %v", err)
+	}
+	if c.Active() {
+		t.Error("conn should be inactive after close")
+	}
+	// Double close should not error
+	if err := c.Close(); err != nil {
+		t.Errorf("double close error: %v", err)
+	}
+}
+
+func TestComputeAcceptKey(t *testing.T) {
+	// RFC 6455 example
+	key := "dGhlIHNhbXBsZSBub25jZQ=="
+	expected := "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+	if got := computeAcceptKey(key); got != expected {
+		t.Errorf("computeAcceptKey = %q, want %q", got, expected)
+	}
+}
