@@ -124,3 +124,9 @@ func TestComputeAcceptKey(t *testing.T) {
 		t.Errorf("computeAcceptKey = %q, want %q", got, expected)
 	}
 }
+
+func TestEpollConn_Interface(t *testing.T) {
+	// We can't test real epoll without a real fd, but we can verify the struct
+	// implements EventDrivenConn interface.
+	var _ EventDrivenConn = (*epollConn)(nil)
+}
