@@ -39,3 +39,28 @@ func TestWSError_WithConnID(t *testing.T) {
 		t.Error("original WSError should not be modified")
 	}
 }
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.ReadBufferSize != 4096 {
+		t.Errorf("ReadBufferSize = %d, want 4096", cfg.ReadBufferSize)
+	}
+	if cfg.WriteBufferSize != 4096 {
+		t.Errorf("WriteBufferSize = %d, want 4096", cfg.WriteBufferSize)
+	}
+	if cfg.TCPNoDelay != true {
+		t.Error("TCPNoDelay should default to true")
+	}
+	if cfg.EventLoopWorkers != 0 {
+		t.Errorf("EventLoopWorkers = %d, want 0 (means auto)", cfg.EventLoopWorkers)
+	}
+	if cfg.PingInterval != 30e9 { // 30s in nanoseconds
+		t.Errorf("PingInterval = %v, want 30s", cfg.PingInterval)
+	}
+	if cfg.PongTimeout != 60e9 {
+		t.Errorf("PongTimeout = %v, want 60s", cfg.PongTimeout)
+	}
+	if cfg.MaxFrameSize != 64*1024*1024 {
+		t.Errorf("MaxFrameSize = %d, want 64MB", cfg.MaxFrameSize)
+	}
+}

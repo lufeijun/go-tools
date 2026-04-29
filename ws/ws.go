@@ -1,6 +1,11 @@
 package ws
 
-import "fmt"
+import (
+	"fmt"
+	"net/http"
+	"runtime"
+	"time"
+)
 
 // WSError is the unified error type for v2.
 type WSError struct {
@@ -43,3 +48,57 @@ const (
 	ErrCodeConnReset       = 2003
 	ErrCodeHubFull         = 3001
 )
+
+// Config is the global configuration for Server and Client.
+// Zero values mean "use default".
+type Config struct {
+	Addr              string
+	ReadBufferSize    int
+	WriteBufferSize   int
+	MaxConnections    int
+	TCPNoDelay        bool
+	TCPQuickAck       bool
+	SOReusePort       bool
+	EventLoopWorkers  int
+	EventLoopStrategy string
+	BufferPoolSmall   int
+	BufferPoolDefault int
+	BufferPoolLarge   int
+	PingInterval      time.Duration
+	PongTimeout       time.Duration
+	MaxFrameSize      int
+	EnableCompression bool
+	Headers           http.Header
+	ReconnectInterval time.Duration
+	MaxReconnect      int
+}
+
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		ReadBufferSize:    4096,
+		WriteBufferSize:   4096,
+		TCPNoDelay:        true,
+		TCPQuickAck:       false,
+		SOReusePort:       false,
+		EventLoopWorkers:  0, // 0 means runtime.NumCPU()
+		EventLoopStrategy: "roundrobin",
+		BufferPoolSmall:   4096,
+		BufferPoolDefault: 1024,
+		BufferPoolLarge:   256,
+		PingInterval:      30 * time.Second,
+		PongTimeout:       60 * time.Second,
+		MaxFrameSize:      64 * 1024 * 1024,
+		EnableCompression: false,
+		ReconnectInterval: 5 * time.Second,
+		MaxReconnect:      5,
+	}
+}
+
+// EventLoopWorkerCount returns the effective number of event loop workers.
+func (c Config) EventLoopWorkerCount() int {
+	if c.EventLoopWorkers > 0 {
+		return c.EventLoopWorkers
+	}
+	return runtime.NumCPU()
+}
