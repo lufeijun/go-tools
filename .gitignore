@@ -19,3 +19,7 @@
 
 # Go workspace file
 go.work
+
+# Demo binaries built in repo root
+/client
+/server
