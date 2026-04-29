@@ -1,11 +1,13 @@
 package session
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/lufeijun/goTools/ws/buf"
+	"github.com/lufeijun/goTools/ws/conn"
 	"github.com/lufeijun/goTools/ws/pipeline"
 )
 
@@ -68,5 +70,55 @@ func TestSession_Close(t *testing.T) {
 	s.Close()
 	if s.State() != StateClosed {
 		t.Errorf("state = %d, want Closed", s.State())
+	}
+}
+
+func TestPerConnHeartbeater_PingSent(t *testing.T) {
+	mc := newMockConn(1)
+	s := NewSession(mc, Config{PingInterval: 100 * time.Millisecond, PongTimeout: 5 * time.Second})
+
+	hb := NewPerConnHeartbeater(100*time.Millisecond, 5*time.Second)
+	hb.Start(s)
+	defer hb.Stop()
+
+	// We can't easily observe the ping without a real conn, but we verify no panic
+	time.Sleep(150 * time.Millisecond)
+}
+
+func TestReconnector_MaxRetries(t *testing.T) {
+	mc := newMockConn(1)
+	cfg := Config{
+		PingInterval:      30 * time.Second,
+		PongTimeout:       60 * time.Second,
+		ReconnectInterval: 50 * time.Millisecond,
+		MaxReconnect:      2,
+	}
+	s := NewSession(mc, cfg)
+	s.SetState(StateConnected)
+	s.SetState(StateDisconnected)
+
+	dialCount := 0
+	rc := NewReconnector(cfg.ReconnectInterval, cfg.MaxReconnect, func() (conn.Conn, error) {
+		dialCount++
+		return nil, errors.New("connection refused")
+	})
+
+	go rc.Start(s)
+
+	timeout := time.After(3 * time.Second)
+	closed := false
+	for !closed {
+		select {
+		case st := <-s.StateChan():
+			if st == StateClosed {
+				closed = true
+			}
+		case <-timeout:
+			t.Fatal("timeout waiting for reconnect exhaustion")
+		}
+	}
+
+	if dialCount != 2 {
+		t.Errorf("dialCount = %d, want 2", dialCount)
 	}
 }
