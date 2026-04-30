@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/lufeijun/goTools/ws"
@@ -18,6 +19,7 @@ type Client interface {
 	Connect() error
 	Close() error
 	Session() session.Session
+	OnConnect(fn func(session.Session))
 }
 
 // NewClient creates a Client with the given config.
@@ -65,14 +67,27 @@ func NewClient(cfg ws.Config) Client {
 }
 
 type defaultClient struct {
-	config ws.Config
-	sess   session.Session
+	config    ws.Config
+	sess      session.Session
+	onConnect func(session.Session)
+	mu        sync.Mutex
+	closed    bool
 }
 
 func (c *defaultClient) Config() ws.Config      { return c.config }
 func (c *defaultClient) Session() session.Session { return c.sess }
+func (c *defaultClient) OnConnect(fn func(session.Session)) {
+	c.onConnect = fn
+}
 
 func (c *defaultClient) Connect() error {
+	c.mu.Lock()
+	c.closed = false
+	c.mu.Unlock()
+	return c.doConnect()
+}
+
+func (c *defaultClient) doConnect() error {
 	nc, err := conn.ClientHandshake(c.config.Addr, c.config.Headers)
 	if err != nil {
 		return err
@@ -94,7 +109,6 @@ func (c *defaultClient) Connect() error {
 	hb.SetOnTimeout(func() {
 		sess.SetState(session.StateDisconnected)
 		wc.Close()
-		// TODO: auto-reconnect (V2.1)
 	})
 	sess.SetState(session.StateConnected)
 	hb.Start(sess)
@@ -105,6 +119,10 @@ func (c *defaultClient) Connect() error {
 	go c.serveConn(nc)
 
 	c.sess = sess
+
+	if c.onConnect != nil {
+		c.onConnect(sess)
+	}
 	return nil
 }
 
@@ -113,7 +131,10 @@ func (c *defaultClient) serveConn(nc net.Conn) {
 	if sess == nil {
 		return
 	}
-	defer sess.Close()
+	defer func() {
+		sess.Close()
+		c.maybeReconnect()
+	}()
 
 	readTimeout := c.config.PongTimeout * 2
 	if readTimeout == 0 {
@@ -150,7 +171,45 @@ func (c *defaultClient) serveConn(nc net.Conn) {
 	}
 }
 
+func (c *defaultClient) maybeReconnect() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+
+	go func() {
+		backoff := c.config.ReconnectInterval
+		for i := 0; i < c.config.MaxReconnect; i++ {
+			time.Sleep(backoff)
+
+			c.mu.Lock()
+			if c.closed {
+				c.mu.Unlock()
+				return
+			}
+			c.mu.Unlock()
+
+			if err := c.doConnect(); err == nil {
+				return
+			}
+
+			if backoff < 60*time.Second {
+				backoff *= 2
+			}
+		}
+		// Reconnect exhausted.
+		if c.sess != nil {
+			c.sess.SetState(session.StateClosed)
+		}
+	}()
+}
+
 func (c *defaultClient) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
 	if c.sess != nil {
 		return c.sess.Close()
 	}

@@ -40,6 +40,7 @@ type Context interface {
 	FireChannelWrite(msg interface{})
 	FireChannelActive()
 	FireChannelInactive()
+	FireExceptionCaught(err error)
 	Write(msg interface{})
 	Flush()
 }

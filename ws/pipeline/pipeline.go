@@ -34,6 +34,7 @@ func (c *handlerContext) FireChannelRead(msg interface{})    { c.invokeChannelRe
 func (c *handlerContext) FireChannelWrite(msg interface{})   { c.invokeChannelWrite(msg) }
 func (c *handlerContext) FireChannelActive()                 { c.invokeChannelActive() }
 func (c *handlerContext) FireChannelInactive()               { c.invokeChannelInactive() }
+func (c *handlerContext) FireExceptionCaught(err error)      { c.invokeExceptionCaught(err) }
 func (c *handlerContext) Write(msg interface{})              { c.invokeChannelWrite(msg) }
 func (c *handlerContext) Flush()                             {}
 
@@ -62,6 +63,13 @@ func (c *handlerContext) invokeChannelInactive() {
 	next := c.findNextInbound()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelInactive(next)
+	}
+}
+
+func (c *handlerContext) invokeExceptionCaught(err error) {
+	next := c.findNextInbound()
+	if next != nil {
+		next.handler.(InboundHandler).ExceptionCaught(next, err)
 	}
 }
 
@@ -162,4 +170,6 @@ func (p *defaultPipeline) FireChannelInactive() {
 	p.head.invokeChannelInactive()
 }
 
-func (p *defaultPipeline) FireExceptionCaught(err error) { /* TODO */ }
+func (p *defaultPipeline) FireExceptionCaught(err error) {
+	p.head.invokeExceptionCaught(err)
+}

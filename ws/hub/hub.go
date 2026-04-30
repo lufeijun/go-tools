@@ -2,10 +2,13 @@ package hub
 
 import (
 	"sync"
+	"unsafe"
 
 	"github.com/lufeijun/goTools/ws/conn"
 	"github.com/lufeijun/goTools/ws/session"
 )
+
+const cacheLineSize = 64
 
 // Hub is the connection management center.
 type Hub interface {
@@ -17,6 +20,8 @@ type Hub interface {
 	Get(id uint64) session.Session
 }
 
+const broadcastQueueSize = 256
+
 // NewHub creates a sharded Hub with the given shard count.
 func NewHub(shardCount int) Hub {
 	if shardCount <= 0 {
@@ -25,9 +30,12 @@ func NewHub(shardCount int) Hub {
 	h := &shardedHub{
 		shardCount: shardCount,
 		shards:     make([]*shard, shardCount),
+		workers:    make([]*broadcastWorker, shardCount),
 	}
 	for i := range h.shards {
 		h.shards[i] = &shard{conns: make(map[uint64]session.Session)}
+		h.workers[i] = &broadcastWorker{shard: h.shards[i], ch: make(chan conn.Message, broadcastQueueSize)}
+		go h.workers[i].run()
 	}
 	return h
 }
@@ -35,11 +43,34 @@ func NewHub(shardCount int) Hub {
 type shardedHub struct {
 	shardCount int
 	shards     []*shard
+	workers    []*broadcastWorker
+}
+
+type broadcastWorker struct {
+	shard *shard
+	ch    chan conn.Message
+}
+
+func (w *broadcastWorker) run() {
+	for msg := range w.ch {
+		w.shard.mu.RLock()
+		sessions := make([]session.Session, 0, len(w.shard.conns))
+		for _, sess := range w.shard.conns {
+			sessions = append(sessions, sess)
+		}
+		w.shard.mu.RUnlock()
+
+		for _, sess := range sessions {
+			sess.Conn().Pipeline().FireChannelWrite(&msg)
+		}
+	}
 }
 
 type shard struct {
 	mu    sync.RWMutex
 	conns map[uint64]session.Session
+	// Pad to a full cache line to prevent false sharing between shards.
+	_     [cacheLineSize - int(unsafe.Sizeof(sync.RWMutex{})) - int(unsafe.Sizeof(map[uint64]session.Session{}))]byte
 }
 
 func (h *shardedHub) shardIndex(id uint64) int {
@@ -79,24 +110,13 @@ func (h *shardedHub) Count() int {
 }
 
 func (h *shardedHub) Broadcast(msg conn.Message) {
-	var wg sync.WaitGroup
-	for _, sh := range h.shards {
-		wg.Add(1)
-		go func(s *shard) {
-			defer wg.Done()
-			s.mu.RLock()
-			sessions := make([]session.Session, 0, len(s.conns))
-			for _, sess := range s.conns {
-				sessions = append(sessions, sess)
-			}
-			s.mu.RUnlock()
-
-			for _, sess := range sessions {
-				sess.Conn().Pipeline().FireChannelWrite(&msg)
-			}
-		}(sh)
+	for _, w := range h.workers {
+		select {
+		case w.ch <- msg:
+		default:
+			// Queue full: drop message for this shard to avoid blocking.
+		}
 	}
-	wg.Wait()
 }
 
 func (h *shardedHub) Send(id uint64, msg conn.Message) {

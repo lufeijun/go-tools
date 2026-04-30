@@ -2,7 +2,6 @@ package eventloop
 
 import (
 	"errors"
-	"sync"
 	"sync/atomic"
 )
 
@@ -45,35 +44,56 @@ const (
 )
 
 type defaultEventLoop struct {
-	poller   Poller
-	handlers map[int]EventHandler
-	mu       sync.RWMutex
-	running  int32
-	stopCh   chan struct{}
+	poller      Poller
+	handlersVal atomic.Value // stores map[int]EventHandler
+	running     int32
+	stopCh      chan struct{}
 }
 
 // NewEventLoop creates a new EventLoop backed by the given Poller.
 func NewEventLoop(p Poller) EventLoop {
-	return &defaultEventLoop{
-		poller:   p,
-		handlers: make(map[int]EventHandler),
-		stopCh:   make(chan struct{}),
+	el := &defaultEventLoop{
+		poller: p,
+		stopCh: make(chan struct{}),
 	}
+	el.handlersVal.Store(make(map[int]EventHandler))
+	return el
+}
+
+func (el *defaultEventLoop) loadHandlers() map[int]EventHandler {
+	return el.handlersVal.Load().(map[int]EventHandler)
+}
+
+func (el *defaultEventLoop) storeHandler(fd int, handler EventHandler) {
+	old := el.loadHandlers()
+	newMap := make(map[int]EventHandler, len(old)+1)
+	for k, v := range old {
+		newMap[k] = v
+	}
+	newMap[fd] = handler
+	el.handlersVal.Store(newMap)
+}
+
+func (el *defaultEventLoop) deleteHandler(fd int) {
+	old := el.loadHandlers()
+	newMap := make(map[int]EventHandler, len(old))
+	for k, v := range old {
+		if k != fd {
+			newMap[k] = v
+		}
+	}
+	el.handlersVal.Store(newMap)
 }
 
 // Register adds fd to the poller and associates it with a handler.
 func (el *defaultEventLoop) Register(fd int, handler EventHandler) error {
-	el.mu.Lock()
-	defer el.mu.Unlock()
-	el.handlers[fd] = handler
+	el.storeHandler(fd, handler)
 	return el.poller.Add(fd, EventRead)
 }
 
 // Deregister removes fd from the poller.
 func (el *defaultEventLoop) Deregister(fd int) error {
-	el.mu.Lock()
-	defer el.mu.Unlock()
-	delete(el.handlers, fd)
+	el.deleteHandler(fd)
 	return el.poller.Del(fd)
 }
 
@@ -111,9 +131,7 @@ func (el *defaultEventLoop) Run() error {
 		}
 
 		for _, e := range events {
-			el.mu.RLock()
-			h, ok := el.handlers[e.FD]
-			el.mu.RUnlock()
+			h, ok := el.loadHandlers()[e.FD]
 			if ok {
 				h.OnEvent(e.FD, e.Events)
 			}
@@ -121,11 +139,24 @@ func (el *defaultEventLoop) Run() error {
 	}
 }
 
-// Stop signals the event loop to exit.
+// Stop signals the event loop to exit and cleans up all registered fds.
 func (el *defaultEventLoop) Stop() error {
 	if !atomic.CompareAndSwapInt32(&el.running, 1, 0) {
 		return errors.New("not running")
 	}
 	close(el.stopCh)
+
+	// Deregister all fds and close the poller.
+	handlers := el.loadHandlers()
+	fds := make([]int, 0, len(handlers))
+	for fd := range handlers {
+		fds = append(fds, fd)
+	}
+	el.handlersVal.Store(make(map[int]EventHandler))
+
+	for _, fd := range fds {
+		_ = el.poller.Del(fd)
+	}
+	_ = el.poller.Close()
 	return nil
 }
