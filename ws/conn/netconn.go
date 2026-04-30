@@ -9,6 +9,14 @@ import (
 	"github.com/lufeijun/goTools/ws/pipeline"
 )
 
+// netConnReadPool reuses 4KB read buffers to reduce GC pressure.
+var netConnReadPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 4096)
+		return &b
+	},
+}
+
 type netConn struct {
 	id        uint64
 	conn      net.Conn
@@ -40,12 +48,14 @@ func (c *netConn) Read(b buf.ByteBuf) error {
 	if !c.Active() {
 		return ErrConnClosed
 	}
-	// Read into a temp buffer then write to ByteBuf
-	tmp := make([]byte, 4096)
+	// Read into a pooled temp buffer then write to ByteBuf.
+	tmpPtr := netConnReadPool.Get().(*[]byte)
+	tmp := *tmpPtr
 	n, err := c.conn.Read(tmp)
 	if n > 0 {
 		b.Write(tmp[:n])
 	}
+	netConnReadPool.Put(tmpPtr)
 	return err
 }
 

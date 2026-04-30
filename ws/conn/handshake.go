@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 var errInvalidHandshake = errors.New("invalid websocket handshake")
+
+const defaultHandshakeTimeout = 10 * time.Second
 
 // ServerHandshake validates the HTTP Upgrade request and returns the raw net.Conn.
 func ServerHandshake(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
@@ -96,13 +99,18 @@ func ClientHandshake(rawURL string, headers http.Header) (net.Conn, error) {
 	}
 	var netConn net.Conn
 	if useTLS {
-		netConn, err = tls.Dial("tcp", host, nil)
+		netConn, err = tls.DialWithDialer(&net.Dialer{Timeout: defaultHandshakeTimeout}, "tcp", host, nil)
 	} else {
-		netConn, err = net.Dial("tcp", host)
+		netConn, err = net.DialTimeout("tcp", host, defaultHandshakeTimeout)
 	}
 	if err != nil {
 		return nil, err
 	}
+
+	// Enforce a deadline for the entire HTTP Upgrade handshake.
+	netConn.SetDeadline(time.Now().Add(defaultHandshakeTimeout))
+	defer netConn.SetDeadline(time.Time{}) // clear after handshake
+
 	secKey, err := generateClientSecKey()
 	if err != nil {
 		netConn.Close()

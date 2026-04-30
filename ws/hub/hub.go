@@ -92,7 +92,7 @@ func (h *shardedHub) Broadcast(msg conn.Message) {
 			s.mu.RUnlock()
 
 			for _, sess := range sessions {
-				_ = sess // TODO: write to pipeline (V2.1)
+				sess.Conn().Pipeline().FireChannelWrite(&msg)
 			}
 		}(sh)
 	}
@@ -104,6 +104,5 @@ func (h *shardedHub) Send(id uint64, msg conn.Message) {
 	if s == nil {
 		return
 	}
-	_ = msg // TODO: write to pipeline (V2.1)
-	_ = s
+	s.Conn().Pipeline().FireChannelWrite(&msg)
 }

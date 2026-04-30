@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/lufeijun/goTools/ws"
 	"github.com/lufeijun/goTools/ws/conn"
@@ -64,7 +67,11 @@ func (s *defaultServer) Start() error {
 
 	s.server = &http.Server{Handler: mux}
 	var err error
-	s.listener, err = net.Listen("tcp", s.config.Addr)
+	if s.config.SOReusePort {
+		s.listener, err = conn.ListenTCPWithReusePort(s.config.Addr)
+	} else {
+		s.listener, err = net.Listen("tcp", s.config.Addr)
+	}
 	if err != nil {
 		return err
 	}
@@ -79,6 +86,10 @@ func (s *defaultServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 	nc, err := conn.ServerHandshake(w, r)
 	if err != nil {
+		return
+	}
+	if err := conn.ApplyTCPOptions(nc, s.config.TCPNoDelay, s.config.TCPQuickAck); err != nil {
+		nc.Close()
 		return
 	}
 
@@ -114,8 +125,16 @@ func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
 		s.hub.Unregister(sess.Conn().ID())
 	}()
 
+	readTimeout := s.config.PongTimeout * 2
+	if readTimeout == 0 {
+		readTimeout = 120 * time.Second
+	}
+
+	br := bufio.NewReaderSize(nc, 65536)
+
 	for {
-		f, err := frame.ReadFrame(nc)
+		nc.SetReadDeadline(time.Now().Add(readTimeout))
+		f, err := frame.ReadFrameLimit(br, s.config.MaxFrameSize)
 		if err != nil {
 			return
 		}
@@ -129,6 +148,13 @@ func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
 			_ = frame.WriteFrame(nc, frame.NewPongFrame(f.Payload))
 
 		case frame.OpcodeClose:
+			code := uint16(1000)
+			reason := ""
+			if len(f.Payload) >= 2 {
+				code = binary.BigEndian.Uint16(f.Payload[:2])
+				reason = string(f.Payload[2:])
+			}
+			_ = frame.WriteFrame(nc, frame.NewCloseFrame(code, reason))
 			return
 		}
 	}

@@ -2,6 +2,8 @@ package session
 
 import (
 	"time"
+
+	"github.com/lufeijun/goTools/ws/conn"
 )
 
 // Heartbeater is the heartbeat interface.
@@ -51,7 +53,9 @@ func (h *perConnHeartbeater) run(s Session) {
 	for {
 		select {
 		case <-ticker.C:
-			// TODO: send ping via conn pipeline (V2.1)
+			if s.Conn() != nil && s.Conn().Pipeline() != nil {
+				s.Conn().Pipeline().FireChannelWrite(&conn.Message{Type: 0x9})
+			}
 		case <-h.stopChan:
 			return
 		}

@@ -2,6 +2,7 @@ package frame
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
@@ -14,6 +15,19 @@ const (
 	OpcodePing   Opcode = 0x9
 	OpcodePong   Opcode = 0xA
 )
+
+// DefaultMaxFrameSize is the default maximum allowed frame payload (64 MB).
+const DefaultMaxFrameSize = 64 * 1024 * 1024
+
+// MaxFrameSizeError is returned when a frame payload exceeds the configured limit.
+type MaxFrameSizeError struct {
+	Limit   int
+	Payload int
+}
+
+func (e *MaxFrameSizeError) Error() string {
+	return fmt.Sprintf("frame payload %d exceeds limit %d", e.Payload, e.Limit)
+}
 
 type Frame struct {
 	FIN     bool
@@ -103,6 +117,16 @@ func WriteFrame(w io.Writer, f Frame) error {
 }
 
 func ReadFrame(r io.Reader) (Frame, error) {
+	return ReadFrameLimit(r, DefaultMaxFrameSize)
+}
+
+// ReadFrameLimit reads a single WebSocket frame with a maximum payload size limit.
+// It also enforces the cumulative limit for fragmented messages.
+func ReadFrameLimit(r io.Reader, maxPayload int) (Frame, error) {
+	return readFrameWithAccumulated(r, maxPayload, 0)
+}
+
+func readFrameWithAccumulated(r io.Reader, maxPayload, accumulatedLen int) (Frame, error) {
 	var result Frame
 	var header [2]byte
 
@@ -134,6 +158,10 @@ func ReadFrame(r io.Reader) (Frame, error) {
 		payloadLen = int(binary.BigEndian.Uint64(lenBytes[:]))
 	}
 
+	if maxPayload > 0 && payloadLen > maxPayload {
+		return Frame{}, &MaxFrameSizeError{Limit: maxPayload, Payload: payloadLen}
+	}
+
 	if result.Masked {
 		if _, err := io.ReadFull(r, result.MaskKey[:]); err != nil {
 			return Frame{}, err
@@ -155,13 +183,21 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	if !result.FIN {
 		firstOpcode := result.Opcode
 		accumulated := result.Payload
+		totalLen := accumulatedLen + len(accumulated)
+		if maxPayload > 0 && totalLen > maxPayload {
+			return Frame{}, &MaxFrameSizeError{Limit: maxPayload, Payload: totalLen}
+		}
 
 		for {
-			next, err := ReadFrame(r)
+			next, err := readFrameWithAccumulated(r, maxPayload, totalLen)
 			if err != nil {
 				return Frame{}, err
 			}
 			accumulated = append(accumulated, next.Payload...)
+			totalLen += len(next.Payload)
+			if maxPayload > 0 && totalLen > maxPayload {
+				return Frame{}, &MaxFrameSizeError{Limit: maxPayload, Payload: totalLen}
+			}
 			if next.FIN {
 				result.FIN = true
 				result.Opcode = firstOpcode

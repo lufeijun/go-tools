@@ -1,6 +1,7 @@
 package session
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/lufeijun/goTools/ws/conn"
@@ -57,6 +58,7 @@ type defaultSession struct {
 	config    Config
 	stateChan chan State
 	state     State
+	closed    int32
 }
 
 // NewSession creates a new Session.
@@ -74,6 +76,9 @@ func (s *defaultSession) State() State            { return s.state }
 func (s *defaultSession) StateChan() <-chan State { return s.stateChan }
 
 func (s *defaultSession) SetState(st State) {
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return
+	}
 	s.state = st
 	select {
 	case s.stateChan <- st:
@@ -82,6 +87,13 @@ func (s *defaultSession) SetState(st State) {
 }
 
 func (s *defaultSession) Close() error {
-	s.SetState(StateClosed)
+	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
+		s.state = StateClosed
+		select {
+		case s.stateChan <- StateClosed:
+		default:
+		}
+		close(s.stateChan)
+	}
 	return s.conn.Close()
 }

@@ -1,7 +1,10 @@
 package client
 
 import (
+	"bufio"
+	"encoding/binary"
 	"net"
+	"time"
 
 	"github.com/lufeijun/goTools/ws"
 	"github.com/lufeijun/goTools/ws/conn"
@@ -74,6 +77,10 @@ func (c *defaultClient) Connect() error {
 	if err != nil {
 		return err
 	}
+	if err := conn.ApplyTCPOptions(nc, c.config.TCPNoDelay, c.config.TCPQuickAck); err != nil {
+		nc.Close()
+		return err
+	}
 
 	wc := conn.NewNetConn(nc, true, 1)
 	sess := session.NewSession(wc, session.Config{
@@ -108,8 +115,16 @@ func (c *defaultClient) serveConn(nc net.Conn) {
 	}
 	defer sess.Close()
 
+	readTimeout := c.config.PongTimeout * 2
+	if readTimeout == 0 {
+		readTimeout = 120 * time.Second
+	}
+
+	br := bufio.NewReaderSize(nc, 65536)
+
 	for {
-		f, err := frame.ReadFrame(nc)
+		nc.SetReadDeadline(time.Now().Add(readTimeout))
+		f, err := frame.ReadFrameLimit(br, c.config.MaxFrameSize)
 		if err != nil {
 			return
 		}
@@ -123,6 +138,13 @@ func (c *defaultClient) serveConn(nc net.Conn) {
 			_ = frame.WriteFrame(nc, frame.NewPongFrame(f.Payload))
 
 		case frame.OpcodeClose:
+			code := uint16(1000)
+			reason := ""
+			if len(f.Payload) >= 2 {
+				code = binary.BigEndian.Uint16(f.Payload[:2])
+				reason = string(f.Payload[2:])
+			}
+			_ = frame.WriteFrame(nc, frame.NewCloseFrame(code, reason))
 			return
 		}
 	}

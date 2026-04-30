@@ -15,6 +15,7 @@ type EventHandler interface {
 type EventLoop interface {
 	Register(fd int, handler EventHandler) error
 	Deregister(fd int) error
+	Mod(fd int, events uint32) error
 	Wake()
 	Run() error
 	Stop() error
@@ -74,6 +75,11 @@ func (el *defaultEventLoop) Deregister(fd int) error {
 	defer el.mu.Unlock()
 	delete(el.handlers, fd)
 	return el.poller.Del(fd)
+}
+
+// Mod updates the events mask for an already-registered fd.
+func (el *defaultEventLoop) Mod(fd int, events uint32) error {
+	return el.poller.Mod(fd, events)
 }
 
 // Wake interrupts the poller wait (not yet implemented).
