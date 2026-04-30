@@ -79,15 +79,15 @@ type Config struct {
     SOReusePort       bool          // 启用 SO_REUSEPORT，默认 false
     EventLoopWorkers  int           // SubEventLoop 数量，默认 runtime.NumCPU()
     EventLoopStrategy string        // 负载均衡策略: "roundrobin" | "leastconn"
-    BufferPoolSmall   int           // 小 buffer 池大小 (≤512B)，默认 4096
-    BufferPoolDefault int           // 默认 buffer 池大小 (≤4096B)，默认 1024
-    BufferPoolLarge   int           // 大 buffer 池大小 (≤65536B)，默认 256
+    BufferPoolSmall   int           // 小 buffer 池对象数 (≤512B)，默认 4096
+    BufferPoolDefault int           // 默认 buffer 池对象数 (≤4096B)，默认 1024
+    BufferPoolLarge   int           // 大 buffer 池对象数 (≤65536B)，默认 256
     PingInterval      time.Duration // 心跳间隔，默认 30s
     PongTimeout       time.Duration // Pong 超时，默认 60s
     MaxFrameSize      int           // 单帧最大载荷，默认 64MB
     EnableCompression bool          // 预留：permessage-deflate 压缩
     Headers           http.Header   // Client 握手时附加的 HTTP 头
-    ReconnectInterval time.Duration // Client 断线后重连间隔，默认 5s
+    ReconnectInterval time.Duration // Client 断线后重连初始间隔，默认 5s
     MaxReconnect      int           // Client 最大重连次数，默认 5
 }
 ```
@@ -168,5 +168,6 @@ srv := server.NewServer(ws.Config{Addr: ":8080"})  // 其他字段自动使用�
 1. **WSError 不可变** — `WithConnID` 返回新实例，不修改原实例
 2. **Config 零值有语义** — `EventLoopWorkers = 0` 表示自动，不是"不启用"
 3. **BufferPool 数字表示对象数** — 不是字节数，而是各自 tier 的 `sync.Pool` 预分配对象数量
-4. **MaxFrameSize 防止内存攻击** — 收到超过此值的帧直接报错断开，建议根据业务调整
+4. **MaxFrameSize 防止内存攻击** — 收到超过此值的帧直接报错断开，建议根据业务调整（如 16MB）
 5. **根包不依赖任何子包** — 确保 `server`/`client` 等子包可以安全 import `ws` 根包
+6. **TCPNoDelay 默认 true** — 生产环境建议保持开启，避免 Nagle 算法导致的小帧延迟

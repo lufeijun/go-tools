@@ -12,6 +12,7 @@ type Client interface {
     Connect() error
     Close() error
     Session() session.Session
+    OnConnect(fn func(session.Session))
 }
 ```
 
@@ -21,6 +22,7 @@ type Client interface {
 | `Connect()` | 连接服务端（阻塞直到握手完成或失败） |
 | `Close()` | 关闭连接 |
 | `Session()` | 获取当前会话（Connect 成功后非 nil） |
+| `OnConnect(fn)` | 注册连接建立回调 |
 
 ---
 
@@ -28,8 +30,11 @@ type Client interface {
 
 ```go
 type defaultClient struct {
-    config ws.Config
-    sess   session.Session
+    config    ws.Config
+    sess      session.Session
+    onConnect func(session.Session)
+    mu        sync.Mutex
+    closed    bool
 }
 ```
 
@@ -71,16 +76,29 @@ c := client.NewClient(ws.Config{
 
 ```go
 func (c *defaultClient) Connect() error {
+    c.mu.Lock()
+    c.closed = false
+    c.mu.Unlock()
+    return c.doConnect()
+}
+
+func (c *defaultClient) doConnect() error {
     // 1. WebSocket 握手
     nc, err := conn.ClientHandshake(c.config.Addr, c.config.Headers)
     if err != nil {
         return err
     }
 
-    // 2. 创建 netConn
+    // 2. 设置 TCP 参数
+    if err := conn.ApplyTCPOptions(nc, c.config.TCPNoDelay, c.config.TCPQuickAck); err != nil {
+        nc.Close()
+        return err
+    }
+
+    // 3. 创建 netConn
     wc := conn.NewNetConn(nc, true, 1)
 
-    // 3. 创建 Session
+    // 4. 创建 Session
     sess := session.NewSession(wc, session.Config{
         PingInterval:      c.config.PingInterval,
         PongTimeout:       c.config.PongTimeout,
@@ -88,7 +106,7 @@ func (c *defaultClient) Connect() error {
         MaxReconnect:      c.config.MaxReconnect,
     })
 
-    // 4. 启动心跳
+    // 5. 启动心跳（共享时间轮）
     hb := session.NewPerConnHeartbeater(c.config.PingInterval, c.config.PongTimeout)
     hb.SetOnTimeout(func() {
         sess.SetState(session.StateDisconnected)
@@ -97,13 +115,17 @@ func (c *defaultClient) Connect() error {
     sess.SetState(session.StateConnected)
     hb.Start(sess)
 
-    // 5. 添加帧编解码器
+    // 6. 添加帧编解码器
     wc.Pipeline().AddLast("codec", &conn.FrameCodec{Writer: nc, IsClient: true})
 
-    // 6. 启动读循环
+    // 7. 触发连接回调
     go c.serveConn(nc)
 
     c.sess = sess
+
+    if c.onConnect != nil {
+        c.onConnect(sess)
+    }
     return nil
 }
 ```
@@ -116,10 +138,21 @@ func (c *defaultClient) serveConn(nc net.Conn) {
     if sess == nil {
         return
     }
-    defer sess.Close()
+    defer func() {
+        sess.Close()
+        c.maybeReconnect()
+    }()
+
+    readTimeout := c.config.PongTimeout * 2
+    if readTimeout == 0 {
+        readTimeout = 120 * time.Second
+    }
+
+    br := bufio.NewReaderSize(nc, 65536)
 
     for {
-        f, err := frame.ReadFrame(nc)
+        nc.SetReadDeadline(time.Now().Add(readTimeout))
+        f, err := frame.ReadFrameLimit(br, c.config.MaxFrameSize)
         if err != nil {
             return
         }
@@ -133,11 +166,64 @@ func (c *defaultClient) serveConn(nc net.Conn) {
             _ = frame.WriteFrame(nc, frame.NewPongFrame(f.Payload))
 
         case frame.OpcodeClose:
+            // RFC 合规：回写 Close 帧
+            code := uint16(1000)
+            reason := ""
+            if len(f.Payload) >= 2 {
+                code = binary.BigEndian.Uint16(f.Payload[:2])
+                reason = string(f.Payload[2:])
+            }
+            _ = frame.WriteFrame(nc, frame.NewCloseFrame(code, reason))
             return
         }
     }
 }
 ```
+
+### 自动重连（P2 优化 5.6）
+
+```go
+func (c *defaultClient) maybeReconnect() {
+    c.mu.Lock()
+    if c.closed {
+        c.mu.Unlock()
+        return
+    }
+    c.mu.Unlock()
+
+    go func() {
+        backoff := c.config.ReconnectInterval
+        for i := 0; i < c.config.MaxReconnect; i++ {
+            time.Sleep(backoff)
+
+            c.mu.Lock()
+            if c.closed {
+                c.mu.Unlock()
+                return
+            }
+            c.mu.Unlock()
+
+            if err := c.doConnect(); err == nil {
+                return
+            }
+
+            // 指数退避：1s → 2s → 4s ... 最大 60s
+            if backoff < 60*time.Second {
+                backoff *= 2
+            }
+        }
+        // 重连耗尽
+        if c.sess != nil {
+            c.sess.SetState(session.StateClosed)
+        }
+    }()
+}
+```
+
+- 初始间隔 `ReconnectInterval`（默认 5s）
+- 每次失败间隔翻倍，最大 60s
+- 达到 `MaxReconnect` 后进入 `StateClosed`
+- `Close()` 可中断重连过程
 
 ---
 
@@ -174,7 +260,7 @@ func (h *PrintHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
     ctx.FireChannelRead(msg)
 }
 
-// 连接成功后注册
+// 连接成功后注册（或在 OnConnect 回调中注册）
 c.Connect()
 c.Session().Conn().Pipeline().AddLast("print", &PrintHandler{})
 ```
@@ -240,9 +326,11 @@ func (h *PrintHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
 
 func main() {
     cfg := ws.Config{
-        Addr:         "ws://localhost:8080/",
-        PingInterval: 30 * time.Second,
-        PongTimeout:  60 * time.Second,
+        Addr:              "ws://localhost:8080/",
+        PingInterval:      30 * time.Second,
+        PongTimeout:       60 * time.Second,
+        ReconnectInterval: 5 * time.Second,
+        MaxReconnect:      5,
     }
     c := client.NewClient(cfg)
 
@@ -250,7 +338,9 @@ func main() {
         log.Fatal("连接失败:", err)
     }
 
-    c.Session().Conn().Pipeline().AddLast("print", &PrintHandler{})
+    c.OnConnect(func(sess session.Session) {
+        sess.Conn().Pipeline().AddLast("print", &PrintHandler{})
+    })
 
     scanner := bufio.NewScanner(os.Stdin)
     for scanner.Scan() {
@@ -271,7 +361,7 @@ func main() {
 
 | 文件 | 内容 |
 |---|---|
-| `client.go` | `Client` 接口、`defaultClient` 实现、Connect/Close/serveConn |
+| `client.go` | `Client` 接口、`defaultClient` 实现、Connect/Close/serveConn/maybeReconnect |
 | `client_test.go` | NewClient、配置测试 |
 
 ---
@@ -279,7 +369,9 @@ func main() {
 ## 注意事项
 
 1. **Connect 成功后才可获取 Session** — `c.Session()` 在 Connect 前返回 nil
-2. **FrameCodec 自动添加** — 无需手动添加，Connect() 内部已处理
-3. **自动重连在 V2.1 完善** — V2.0 断线后不会自动重连，需要业务层检测并重新 Connect
+2. **FrameCodec 自动添加** — 无需手动添加，`doConnect()` 内部已处理
+3. **自动重连已实现** — 断线后按指数退避策略自动重连（1s → 2s → 4s ... 最大 60s）
 4. **Ping 自动回复 Pong** — 在 serveConn 中处理，不经过 Pipeline
 5. **Headers 用于握手时附加 HTTP 头** — 如认证 Token：`cfg.Headers = http.Header{"Authorization": []string{"Bearer xxx"}}`
+6. **Close 帧 RFC 合规** — 收到 Close 后回写 Close 响应帧再断开
+7. **读 deadline 防止泄漏** — serveConn 带 read deadline，心跳超时兜底

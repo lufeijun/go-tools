@@ -354,16 +354,17 @@ func readFrameBufWithAccumulated(r io.Reader, pool buf.Pool, maxPayload, accumul
 	}
 
 	if payloadLen > 0 {
-		tmp := make([]byte, payloadLen)
-		if _, err := io.ReadFull(r, tmp); err != nil {
+		bb.EnsureWritable(payloadLen)
+		data := bb.Bytes()[bb.WriterIndex():bb.WriterIndex()+payloadLen]
+		if _, err := io.ReadFull(r, data); err != nil {
 			bb.Release()
 			return Frame{}, nil, err
 		}
 		if result.Masked {
-			tmp = applyMask(tmp, result.MaskKey)
+			applyMaskInPlace(data, result.MaskKey)
 			result.Masked = false
 		}
-		bb.Write(tmp)
+		bb.SetWriterIndex(bb.WriterIndex() + payloadLen)
 	}
 
 	// Payload is the trailing bytes after the header.
@@ -406,4 +407,77 @@ func readFrameBufWithAccumulated(r io.Reader, pool buf.Pool, maxPayload, accumul
 	}
 
 	return result, bb, nil
+}
+
+// ReadFrameFromBuf parses a single WebSocket frame from a ByteBuf using
+// Peek+Skip for zero-copy header inspection.
+//
+// The returned Frame.Payload references the ByteBuf's backing array; the caller
+// MUST ensure the ByteBuf outlives the Frame or copy the payload if needed.
+// If the frame is masked, the payload is unmasked in-place inside the ByteBuf.
+//
+// If bb does not contain a complete frame, io.ErrShortBuffer is returned and
+// bb's reader index is left unchanged (the function rewinds on failure).
+func ReadFrameFromBuf(bb buf.ByteBuf, maxPayload int) (Frame, error) {
+	start := bb.ReaderIndex()
+	if bb.ReadableBytes() < 2 {
+		return Frame{}, io.ErrShortBuffer
+	}
+	header := bb.Peek(2)
+	bb.Skip(2)
+
+	var result Frame
+	result.FIN = header[0]&0x80 != 0
+	result.RSV1 = header[0]&0x40 != 0
+	result.RSV2 = header[0]&0x20 != 0
+	result.RSV3 = header[0]&0x10 != 0
+	result.Opcode = Opcode(header[0] & 0x0F)
+	result.Masked = header[1]&0x80 != 0
+	payloadLen := int(header[1] & 0x7F)
+
+	switch payloadLen {
+	case 126:
+		if bb.ReadableBytes() < 2 {
+			bb.SetReaderIndex(start)
+			return Frame{}, io.ErrShortBuffer
+		}
+		payloadLen = int(binary.BigEndian.Uint16(bb.Peek(2)))
+		bb.Skip(2)
+	case 127:
+		if bb.ReadableBytes() < 8 {
+			bb.SetReaderIndex(start)
+			return Frame{}, io.ErrShortBuffer
+		}
+		payloadLen = int(binary.BigEndian.Uint64(bb.Peek(8)))
+		bb.Skip(8)
+	}
+
+	if maxPayload > 0 && payloadLen > maxPayload {
+		bb.SetReaderIndex(start)
+		return Frame{}, &MaxFrameSizeError{Limit: maxPayload, Payload: payloadLen}
+	}
+
+	if result.Masked {
+		if bb.ReadableBytes() < 4 {
+			bb.SetReaderIndex(start)
+			return Frame{}, io.ErrShortBuffer
+		}
+		copy(result.MaskKey[:], bb.Peek(4))
+		bb.Skip(4)
+	}
+
+	if payloadLen > 0 {
+		if bb.ReadableBytes() < payloadLen {
+			bb.SetReaderIndex(start)
+			return Frame{}, io.ErrShortBuffer
+		}
+		result.Payload = bb.Peek(payloadLen)
+		if result.Masked {
+			applyMaskInPlace(result.Payload, result.MaskKey)
+			result.Masked = false
+		}
+		bb.Skip(payloadLen)
+	}
+
+	return result, nil
 }

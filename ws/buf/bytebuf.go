@@ -1,3 +1,11 @@
+// Package buf provides reference-counted ByteBuf with separate read/write
+// indexes and tiered object pooling.
+//
+// Thread safety: ByteBuf is NOT thread-safe.  A single ByteBuf must be
+// accessed by only one goroutine at a time.  To transfer ownership across
+// goroutines use Retain() on the sender side and Release() on the receiver
+// side.  Peek/ReadBytes/Slice create views that share the underlying array
+// and must also obey the single-writer rule.
 package buf
 
 import (
@@ -105,13 +113,32 @@ func (b *byteBuf) EnsureWritable(min int) {
 	if needed <= cap(b.data) {
 		return
 	}
-	newCap := cap(b.data) * 2
-	if newCap < needed {
-		newCap = needed
-	}
-	newData := make([]byte, len(b.data), newCap)
+	// Align to power-of-two tiers for better pool reuse.
+	newCap := roundUpPowerOf2(needed)
+	newData := make([]byte, b.writerIndex, newCap)
 	copy(newData, b.data)
 	b.data = newData
+}
+
+func roundUpPowerOf2(n int) int {
+	if n <= 512 {
+		return 512
+	}
+	if n <= 4096 {
+		return 4096
+	}
+	if n <= 65536 {
+		return 65536
+	}
+	// Next power of two for larger values.
+	n--
+	n |= n >> 1
+	n |= n >> 2
+	n |= n >> 4
+	n |= n >> 8
+	n |= n >> 16
+	n++
+	return n
 }
 
 func (b *byteBuf) Slice(start, length int) ByteBuf {

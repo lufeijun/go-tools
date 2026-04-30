@@ -12,6 +12,7 @@
 2. **引用计数** — 同一份数据在多个 goroutine/连接间传递时，防止提前释放
 3. **零拷贝切片** — `Slice()` 创建共享底层数组的新视图，不复制数据
 4. **分级对象池** — 按容量分级回收，减少大对象 GC 压力
+5. **对齐扩容** — 按 Pool 档位对齐，提高复用率
 
 ---
 
@@ -90,16 +91,27 @@ WritableBytes() = capacity - writerIndex = 4
 ```
 
 - `Write()` 从 `writerIndex` 开始写入，然后后移 `writerIndex`
-- `ReadBytes(n)` 从 `readerIndex` 开始读取 `n` 字节，然后后移 `readerIndex`
+- `ReadBytes(n)` 从 `readerIndex` 开始读取 n 字节，然后后移 `readerIndex`
 - `Peek(n)` 同 `ReadBytes` 但不移动 `readerIndex`
 - `Skip(n)` 直接后移 `readerIndex`
 
-### 自动扩容
+### 自动扩容与对齐
 
-`EnsureWritable(min)` 会在 `WritableBytes() < min` 时自动扩容：
-- 优先尝试 `cap(data) * 2`
-- 若仍不足，则按 `needed` 精确分配
-- 通过 `make` + `copy` 迁移数据
+`EnsureWritable(min)` 在 `WritableBytes() < min` 时自动扩容：
+
+1. 计算 `needed = writerIndex + min`
+2. 若 `needed <= cap(data)`，直接扩展切片长度，返回
+3. 否则按 **Pool 档位对齐** 分配新数组：
+   - `<= 512` → 512
+   - `<= 4096` → 4096
+   - `<= 65536` → 65536
+   - `> 65536` → 下一个 2 的幂
+4. 通过 `make` + `copy` 迁移数据
+
+**为什么对齐？**
+
+- 对齐后的容量恰好是 Pool 的某个档位，`Release()` 时可以精准放回对应 Pool
+- 非对齐容量（如 1500）可能落入 default 档位，但下次 `Get(1500)` 取出的 4096B buffer 被浪费
 
 ---
 
@@ -122,16 +134,20 @@ WritableBytes() = capacity - writerIndex = 4
 func (b *byteBuf) Release() {
     rc := atomic.AddInt32(&b.refCount, -1)
     if rc == 0 {
-        // 回收到 Pool
+        b.readerIndex = 0
+        b.writerIndex = 0
+        if b.pool != nil {
+            b.pool.Put(b)
+        }
     } else if rc < 0 {
-        panic("double free detected")
+        panic(fmt.Sprintf("ByteBuf(%p) double free detected, refCount=%d", b, rc))
     }
 }
 ```
 
 - **Double-free 保护**：`Release()` 后 `refCount < 0` 直接 `panic`
-- **已释放操作保护**：`Retain()` 时若 `refCount <= 1` 也 `panic`
-- 开发阶段通过 `go test` + `go vet` 覆盖所有路径
+- **已释放操作保护**：`Retain()` 时若 `refCount <= 1` 也 `panic`（已释放 buffer 上操作）
+- 开发阶段通过 `go test -race` 覆盖所有路径
 
 ### 使用示例
 
@@ -156,14 +172,14 @@ func main() {
     fmt.Printf("Peek(5): %s\n", string(peek))        // hello
     fmt.Printf("Peek 后可读: %d\n", bb.ReadableBytes()) // 还是 11
 
-    // 4. ReadBytes — 移动读指针
+    // 4. ReadBytes — 移动读指针（会 alloc 新 slice）
     data := bb.ReadBytes(5)
     fmt.Printf("ReadBytes(5): %s\n", string(data))    // hello
     fmt.Printf("读取后可读: %d\n", bb.ReadableBytes())  // 6
 
     // 5. 零拷贝切片
-    sliced := bb.Slice(0, 5) // 取前 5 个字节
-    sliced.Release()         // 释放切片视图
+    sliced := bb.Slice(0, 5) // 取前 5 个字节，原始 refCount +1
+    sliced.Release()         // 释放切片视图，原始 refCount -1
 
     // 6. 释放原始 ByteBuf
     bb.Release()
@@ -199,25 +215,59 @@ func NewPool(smallSize, defaultSize, largeSize int) Pool
 
 ```go
 // Get：按需求容量选择级别，优先从 sync.Pool 复用
-b := p.Get(100)   // 从 smallPool 取
-b := p.Get(5000)  // 从 defaultPool 取
+b := p.Get(100)   // 从 smallPool 取，底层 cap = 512
+b := p.Get(5000)  // 从 defaultPool 取，底层 cap = 4096
 b := p.Get(200000)// 直接 make，不归 Pool
 
 // Put：按底层数组 cap 放回对应级别
 b.Release()       // 如果 b 来自 Pool，自动归还
 ```
 
-注意：`Release()` 时会检查 `pool != nil`，只有从 Pool 取出的才会归还。
+注意：`Release()` 时会检查 `pool != nil`，只有从 Pool 取出的才会归还。`NewByteBuf` 创建的 `Release()` 后直接丢弃。
+
+---
+
+## 线程安全声明
+
+**ByteBuf 不是线程安全的。** 必须遵守以下规则：
+
+1. **单写原则** — 同一时间只应有一个 goroutine 读写 ByteBuf
+2. **跨 goroutine 传递** — 发送方调用 `Retain()`，接收方处理完后调用 `Release()`
+3. `Peek/ReadBytes/Slice` 创建的视图共享底层数组，也必须遵守单写规则
+
+这条规则在 `bytebuf.go` 包注释中有明确声明：
+
+```go
+// Thread safety: ByteBuf is NOT thread-safe.  A single ByteBuf must be
+// accessed by only one goroutine at a time.  To transfer ownership across
+// goroutines use Retain() on the sender side and Release() on the receiver
+// side.  Peek/ReadBytes/Slice create views that share the underlying array
+// and must also obey the single-writer rule.
+```
 
 ---
 
 ## 与 frame 层的协作
 
-`frame.ReadFrame` 和 `frame.WriteFrame` 直接操作 `ByteBuf` 的 `ReaderIndex`/`WriterIndex`，避免多次内存拷贝：
+`frame.ReadFrameBuf` 和 `frame.WriteFrameTo` 直接操作 `ByteBuf` 的 `ReaderIndex`/`WriterIndex`，避免多次内存拷贝：
 
-- **读方向**：`eventloop` 读数据直接写入 `ByteBuf` → `FrameDecoder` 解析时通过 `Slice()` 共享 Payload
-- **写方向**：`FrameEncoder` 直接写入发送队列的 `ByteBuf`，合并 header + payload 后单次 `write()`
+- **读方向**：`eventloop` 读数据直接写入 `ByteBuf` → `ReadFrameFromBuf` 通过 `Peek+Skip` 零拷贝解析
+- **写方向**：`FrameCodec` 直接写入发送队列的 `ByteBuf`，合并 header + payload 后单次 `write()`
 - **广播**：同一份 `ByteBuf` 通过 `Retain()` 增加引用计数，发送到多个连接后各 `Release()`
+
+---
+
+## Benchmark 基线
+
+```go
+BenchmarkByteBuf_Write        // 写 128B 数据 + Release
+BenchmarkByteBuf_ReadBytes    // 读 64B + rewind
+BenchmarkByteBuf_PeekSkip     // Peek 64B + Skip 64B + rewind
+BenchmarkByteBuf_Slice        // Slice 0,64 + Release
+BenchmarkByteBuf_PoolGetPut   // Pool.Get + Write 200B + Release
+```
+
+运行：`go test ./ws/buf -bench=. -benchmem`
 
 ---
 
@@ -229,6 +279,7 @@ b.Release()       // 如果 b 来自 Pool，自动归还
 | `pool.go` | `Pool` 接口 + `bufPool` 分级对象池 |
 | `bytebuf_test.go` | 读写、切片、引用计数、double-free panic 测试 |
 | `pool_test.go` | 分级 Get/Put、复用测试 |
+| `buf_bench_test.go` | 性能基准测试 |
 
 ---
 
@@ -238,3 +289,4 @@ b.Release()       // 如果 b 来自 Pool，自动归还
 2. **不要在 Release 后操作 ByteBuf** — 会触发 panic，这是设计上的刻意保护
 3. **NewByteBuf 不归 Pool** — 只有通过 `Pool.Get()` 创建的才关联 Pool，`NewByteBuf` 创建的 `Release()` 后直接丢弃
 4. **Slice 会 Retain 原始 buf** — 释放顺序不影响安全，但建议先 `Release` 切片再 `Release` 原始 buf
+5. **EnsureWritable 按 Pool 档位对齐** — 扩容后的容量可能大于请求值，这是为了提高 Pool 命中率

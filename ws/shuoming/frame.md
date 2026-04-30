@@ -11,6 +11,7 @@
 - **无外部依赖**：不依赖 `buf`、`pipeline`、`conn` 等上层包
 - **独立可用**：任何需要 RFC 6455 帧解析的 Go 项目都可以直接 import
 - **兼容 v1**：v1 的测试用例全部保留，确保协议实现稳定性
+- **高安全**：MaxFrameSize 校验、分片重组上限，防止 DoS
 
 ---
 
@@ -82,7 +83,9 @@ func NewPongFrame(data []byte) Frame
 func NewCloseFrame(code uint16, reason string) Frame
 ```
 
-### 序列化：WriteFrame
+### 序列化
+
+#### WriteFrame（标准路径）
 
 ```go
 func WriteFrame(w io.Writer, f Frame) error
@@ -97,20 +100,86 @@ func WriteFrame(w io.Writer, f Frame) error
 5. 写入 Payload
 6. **单次 `w.Write()` 发送全部数据**，避免 Nagle + Delayed ACK 交互延迟
 
-### 解析：ReadFrame
+#### WriteFrameTo（零拷贝路径）
+
+```go
+func WriteFrameTo(dst buf.ByteBuf, f Frame) error
+```
+
+直接序列化到传入的 `ByteBuf`，无堆分配。配合 Pool 使用可实现零 alloc 写帧：
+
+```go
+pool := buf.NewPool(512, 4096, 65536)
+bb := pool.Get(256)
+_ = WriteFrameTo(bb, f)
+// 写入连接...
+bb.Release()
+```
+
+### 解析
+
+#### ReadFrame（标准路径）
 
 ```go
 func ReadFrame(r io.Reader) (Frame, error)
 ```
 
-从 `io.Reader` 读取并解析完整帧。逻辑：
+从 `io.Reader` 读取并解析完整帧，自动处理分片帧合并。
 
-1. 读取 2 字节基础头部
-2. 解析 `FIN`、`RSV`、`Opcode`、`MASK`、基础长度
-3. 若长度为 126/127，读取扩展长度字段
-4. 若 `Masked`，读取 4 字节掩码密钥，并对 Payload 做去掩码
-5. 读取 Payload 数据
-6. **自动处理分片帧**：若非 `FIN`，循环读取后续 Continuation 帧，合并 Payload
+#### ReadFrameLimit（安全路径）
+
+```go
+func ReadFrameLimit(r io.Reader, maxPayload int) (Frame, error)
+```
+
+带 MaxFrameSize 限制的帧解析：
+
+- 读取 payload 长度后立即校验，超过 `maxPayload` 返回 `MaxFrameSizeError`
+- 分片重组时累加已读长度，超过限制立即报错断开
+- **防止恶意客户端发送极大长度帧头导致 OOM**
+
+#### ReadFrameFromBuf（零拷贝 Peek+Skip 路径）
+
+```go
+func ReadFrameFromBuf(bb buf.ByteBuf, maxPayload int) (Frame, error)
+```
+
+从 `ByteBuf` 使用 **Peek+Skip** 零拷贝解析帧：
+
+- 帧头通过 `Peek` 查看底层数组，不移动 reader index
+- 完整帧解析完成后通过 `Skip` 消费已读字节
+- Payload 直接引用 `ByteBuf` 底层数组，无需 `make` 临时 slice
+- 若 `ByteBuf` 数据不完整，返回 `io.ErrShortBuffer` 并 **rewind reader index**
+- 适合 `bufio.Reader` 批量预读后的内存中解析
+
+```go
+bb := buf.NewByteBuf(512)
+bb.Write(rawFrameData)
+f, err := ReadFrameFromBuf(bb, 64*1024*1024)
+// f.Payload 是 bb 底层数组的视图，零拷贝
+```
+
+#### ReadFrameBuf（Pool 零拷贝路径）
+
+```go
+func ReadFrameBuf(r io.Reader, pool buf.Pool, maxPayload int) (Frame, buf.ByteBuf, error)
+```
+
+从 `io.Reader` 读取并解析帧，使用 Pool 获取 `ByteBuf`：
+
+- 帧头和 Payload 全部写入同一个 `ByteBuf`
+- Payload 直接引用 `ByteBuf` 底层数组
+- 返回的 `ByteBuf` 由调用者负责 `Release()`
+- 适合需要管理 ByteBuf 生命周期的场景（如 Pipeline Handler）
+
+```go
+f, bb, err := ReadFrameBuf(reader, pool, maxPayload)
+if err != nil {
+    return err
+}
+defer bb.Release()
+// f.Payload Backed by bb
+```
 
 ---
 
@@ -119,15 +188,17 @@ func ReadFrame(r io.Reader) (Frame, error)
 RFC 6455 要求客户端发送的帧必须掩码，服务端发送的帧不掩码。
 
 ```go
-// applyMask XORs the payload with the mask key per RFC 6455.
+// applyMask 返回新切片，不修改输入（适合客户端 Outbound）
 func applyMask(payload []byte, maskKey [4]byte) []byte
 
-// GenerateMaskKey generates a random 4-byte mask key using crypto/rand.
+// applyMaskInPlace 原地修改，无分配（适合服务端 Inbound）
+func applyMaskInPlace(payload []byte, maskKey [4]byte)
+
+// GenerateMaskKey 使用 crypto/rand 生成，密码学安全
 func GenerateMaskKey() [4]byte
 ```
 
-- `applyMask` 返回**新切片**，不修改输入
-- `GenerateMaskKey` 使用 `crypto/rand` 生成，密码学安全
+**优化点：** 服务端 Inbound 路径使用 `applyMaskInPlace`，直接修改 `ByteBuf` 底层数组或 `ReadFrameBuf` 的 payload 区域，**每条入站消息减少一次 payload 级别的 alloc**。
 
 ---
 
@@ -135,15 +206,21 @@ func GenerateMaskKey() [4]byte
 
 WebSocket 允许将一条消息拆分为多个帧发送（除首帧外，后续为 Continuation 帧，`Opcode = 0x0`）。
 
-`ReadFrame` 内部自动合并：
+`ReadFrame` / `ReadFrameLimit` / `ReadFrameBuf` 内部自动合并：
 
 ```go
 if !result.FIN {
     firstOpcode := result.Opcode
     accumulated := result.Payload
+    totalLen := len(accumulated)
     for {
-        next, err := ReadFrame(r)
+        next, err := readFrameWithAccumulated(r, maxPayload, totalLen)
+        // ...
         accumulated = append(accumulated, next.Payload...)
+        totalLen += len(next.Payload)
+        if maxPayload > 0 && totalLen > maxPayload {
+            return Frame{}, &MaxFrameSizeError{...}
+        }
         if next.FIN {
             result.FIN = true
             result.Opcode = firstOpcode
@@ -154,7 +231,9 @@ if !result.FIN {
 }
 ```
 
-使用者无需关心分片，每次 `ReadFrame` 都收到完整消息。
+使用者无需关心分片，每次调用都收到完整消息。
+
+**安全加固：** 分片重组时累加已读长度，超过 `MaxFrameSize` 立即返回错误，防止恶意客户端通过无限 continuation 帧耗尽内存。
 
 ---
 
@@ -176,22 +255,37 @@ func PutBuf(buf []byte)
 
 ---
 
+## Benchmark 基线
+
+```go
+BenchmarkWriteFrame      // 标准 WriteFrame
+BenchmarkWriteFrameTo    // 零拷贝 WriteFrameTo（Pool 命中时零 alloc）
+BenchmarkReadFrame       // 标准 ReadFrame
+```
+
+运行：`go test ./ws/frame -bench=. -benchmem`
+
+---
+
 ## 文件清单
 
 | 文件 | 内容 |
 |---|---|
-| `frame.go` | `Frame` 结构体、`Opcode`、ReadFrame、WriteFrame、便捷构造函数 |
-| `mask.go` | `applyMask`、`GenerateMaskKey` |
+| `frame.go` | `Frame` 结构体、`Opcode`、ReadFrame/ReadFrameLimit/ReadFrameFromBuf/ReadFrameBuf、WriteFrame/WriteFrameTo、便捷构造函数 |
+| `mask.go` | `applyMask`、`applyMaskInPlace`、`GenerateMaskKey` |
 | `pool.go` | 内部 `sync.Pool`：`GetBuf`、`PutBuf` |
-| `frame_test.go` | v1 保留的帧解析/序列化测试 |
-| `mask_test.go` | 掩码正确性测试 |
+| `frame_test.go` | 帧解析/序列化/零拷贝路径测试 |
+| `mask_test.go` | 掩码正确性/原地 XOR 测试 |
 | `pool_test.go` | buffer 池测试 |
+| `frame_bench_test.go` | 性能基准测试 |
 
 ---
 
 ## 注意事项
 
 1. **ReadFrame 阻塞读取** — 使用 `io.ReadFull`，在网络层确保数据到达前会阻塞
-2. **自动合并不保留中间帧** — 分片帧的 `RSV`、`MaskKey` 等中间信息丢失，只保留合并后的 `Payload`
-3. **Close 帧的 code/reason 由调用方处理** — `NewCloseFrame` 帮你打包，但发送/响应逻辑在 `server`/`client` 层
-4. **v2 中 frame 层被 codec.go 封装** — 用户业务代码通常操作 `conn.Message` 而非直接使用 `frame.Frame`
+2. **ReadFrameFromBuf 不阻塞** — 从内存 ByteBuf 解析，数据不完整时返回 `io.ErrShortBuffer`
+3. **自动合并不保留中间帧** — 分片帧的 `RSV`、`MaskKey` 等中间信息丢失，只保留合并后的 `Payload`
+4. **Close 帧的 code/reason 由调用方处理** — `NewCloseFrame` 帮你打包，但发送/响应逻辑在 `server`/`client` 层
+5. **v2 中 frame 层被 codec.go 封装** — 用户业务代码通常操作 `conn.Message` 而非直接使用 `frame.Frame`
+6. **MaxFrameSize 必须设置** — 生产环境应根据业务调整，防止 DoS

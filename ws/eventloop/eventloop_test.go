@@ -2,21 +2,26 @@ package eventloop
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type mockHandler struct {
-	called bool
-	fd     int
-	evts   uint32
+	called atomic.Bool
+	fd     atomic.Int64
+	evts   atomic.Uint32
 }
 
 func (m *mockHandler) OnEvent(fd int, events uint32) {
-	m.called = true
-	m.fd = fd
-	m.evts = events
+	m.called.Store(true)
+	m.fd.Store(int64(fd))
+	m.evts.Store(events)
 }
+
+func (m *mockHandler) wasCalled() bool     { return m.called.Load() }
+func (m *mockHandler) lastFd() int         { return int(m.fd.Load()) }
+func (m *mockHandler) lastEvents() uint32  { return m.evts.Load() }
 
 func TestEventConstants(t *testing.T) {
 	if EventRead != 1 {
@@ -149,20 +154,20 @@ func TestDefaultEventLoop_Dispatch(t *testing.T) {
 	}()
 
 	for i := 0; i < 50; i++ {
-		if h.called {
+		if h.wasCalled() {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if !h.called {
+	if !h.wasCalled() {
 		t.Error("expected handler to be called")
 	}
-	if h.fd != 1 {
-		t.Errorf("handler fd = %d, want 1", h.fd)
+	if h.lastFd() != 1 {
+		t.Errorf("handler fd = %d, want 1", h.lastFd())
 	}
-	if h.evts != EventRead {
-		t.Errorf("handler events = %d, want %d", h.evts, EventRead)
+	if h.lastEvents() != EventRead {
+		t.Errorf("handler events = %d, want %d", h.lastEvents(), EventRead)
 	}
 
 	if err := el.Stop(); err != nil {

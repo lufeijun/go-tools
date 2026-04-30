@@ -17,6 +17,14 @@ func applyMask(payload []byte, maskKey [4]byte) []byte {
 	return masked
 }
 
+// applyMaskInPlace XORs the payload with the mask key in place.
+// The input slice is modified directly; no allocation occurs.
+func applyMaskInPlace(payload []byte, maskKey [4]byte) {
+	for i := range payload {
+		payload[i] ^= maskKey[i%4]
+	}
+}
+
 // GenerateMaskKey generates a random 4-byte mask key using crypto/rand.
 func GenerateMaskKey() [4]byte {
 	var key [4]byte

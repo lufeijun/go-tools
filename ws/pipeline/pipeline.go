@@ -1,6 +1,9 @@
 package pipeline
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // NewPipeline creates a new ChannelPipeline.
 func NewPipeline() ChannelPipeline {
@@ -14,6 +17,42 @@ func NewPipeline() ChannelPipeline {
 	return p
 }
 
+func (p *defaultPipeline) rebuild() {
+	var lastInbound *handlerContext
+	for ctx := p.head.next; ctx != p.tail; ctx = ctx.next {
+		if _, ok := ctx.handler.(InboundHandler); ok {
+			if lastInbound != nil {
+				lastInbound.nextInbound.Store(ctx)
+			} else {
+				p.head.nextInbound.Store(ctx)
+			}
+			lastInbound = ctx
+		}
+	}
+	if lastInbound != nil {
+		lastInbound.nextInbound.Store(nil)
+	} else {
+		p.head.nextInbound.Store(nil)
+	}
+
+	var lastOutbound *handlerContext
+	for ctx := p.tail.prev; ctx != p.head; ctx = ctx.prev {
+		if _, ok := ctx.handler.(OutboundHandler); ok {
+			if lastOutbound != nil {
+				lastOutbound.prevOutbound.Store(ctx)
+			} else {
+				p.tail.prevOutbound.Store(ctx)
+			}
+			lastOutbound = ctx
+		}
+	}
+	if lastOutbound != nil {
+		lastOutbound.prevOutbound.Store(nil)
+	} else {
+		p.tail.prevOutbound.Store(nil)
+	}
+}
+
 type defaultPipeline struct {
 	mu   sync.RWMutex // protects ctxs map and linked list during setup; event traversal is lock-free
 	head *handlerContext
@@ -22,73 +61,59 @@ type defaultPipeline struct {
 }
 
 type handlerContext struct {
-	pipeline *defaultPipeline
-	name     string
-	handler  ChannelHandler
-	prev     *handlerContext
-	next     *handlerContext
+	pipeline     *defaultPipeline
+	name         string
+	handler      ChannelHandler
+	prev         *handlerContext
+	next         *handlerContext
+	nextInbound  atomic.Pointer[handlerContext] // next InboundHandler in chain (head→tail)
+	prevOutbound atomic.Pointer[handlerContext] // previous OutboundHandler in chain (tail→head)
 }
 
-func (c *handlerContext) Pipeline() ChannelPipeline          { return c.pipeline }
-func (c *handlerContext) FireChannelRead(msg interface{})    { c.invokeChannelRead(msg) }
-func (c *handlerContext) FireChannelWrite(msg interface{})   { c.invokeChannelWrite(msg) }
-func (c *handlerContext) FireChannelActive()                 { c.invokeChannelActive() }
-func (c *handlerContext) FireChannelInactive()               { c.invokeChannelInactive() }
-func (c *handlerContext) FireExceptionCaught(err error)      { c.invokeExceptionCaught(err) }
-func (c *handlerContext) Write(msg interface{})              { c.invokeChannelWrite(msg) }
-func (c *handlerContext) Flush()                             {}
+func (c *handlerContext) Pipeline() ChannelPipeline       { return c.pipeline }
+func (c *handlerContext) FireChannelRead(msg interface{}) { c.invokeChannelRead(msg) }
+func (c *handlerContext) FireChannelWrite(msg interface{}) {
+	c.invokeChannelWrite(msg)
+}
+func (c *handlerContext) FireChannelActive()            { c.invokeChannelActive() }
+func (c *handlerContext) FireChannelInactive()          { c.invokeChannelInactive() }
+func (c *handlerContext) FireExceptionCaught(err error) { c.invokeExceptionCaught(err) }
+func (c *handlerContext) Write(msg interface{})         { c.invokeChannelWrite(msg) }
+func (c *handlerContext) Flush()                        {}
 
 func (c *handlerContext) invokeChannelRead(msg interface{}) {
-	next := c.findNextInbound()
+	next := c.nextInbound.Load()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelRead(next, msg)
 	}
 }
 
 func (c *handlerContext) invokeChannelWrite(msg interface{}) {
-	prev := c.findPrevOutbound()
+	prev := c.prevOutbound.Load()
 	if prev != nil {
 		prev.handler.(OutboundHandler).Write(prev, msg)
 	}
 }
 
 func (c *handlerContext) invokeChannelActive() {
-	next := c.findNextInbound()
+	next := c.nextInbound.Load()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelActive(next)
 	}
 }
 
 func (c *handlerContext) invokeChannelInactive() {
-	next := c.findNextInbound()
+	next := c.nextInbound.Load()
 	if next != nil {
 		next.handler.(InboundHandler).ChannelInactive(next)
 	}
 }
 
 func (c *handlerContext) invokeExceptionCaught(err error) {
-	next := c.findNextInbound()
+	next := c.nextInbound.Load()
 	if next != nil {
 		next.handler.(InboundHandler).ExceptionCaught(next, err)
 	}
-}
-
-func (c *handlerContext) findNextInbound() *handlerContext {
-	for ctx := c.next; ctx != nil; ctx = ctx.next {
-		if _, ok := ctx.handler.(InboundHandler); ok {
-			return ctx
-		}
-	}
-	return nil
-}
-
-func (c *handlerContext) findPrevOutbound() *handlerContext {
-	for ctx := c.prev; ctx != nil; ctx = ctx.prev {
-		if _, ok := ctx.handler.(OutboundHandler); ok {
-			return ctx
-		}
-	}
-	return nil
 }
 
 func (p *defaultPipeline) AddFirst(name string, handler ChannelHandler) ChannelPipeline {
@@ -106,6 +131,7 @@ func (p *defaultPipeline) AddFirst(name string, handler ChannelHandler) ChannelP
 	ctx := &handlerContext{pipeline: p, name: name, handler: handler}
 	p.insertAfter(p.head, ctx)
 	p.ctxs[name] = ctx
+	p.rebuild()
 	return p
 }
 
@@ -124,6 +150,7 @@ func (p *defaultPipeline) AddLast(name string, handler ChannelHandler) ChannelPi
 	ctx := &handlerContext{pipeline: p, name: name, handler: handler}
 	p.insertBefore(p.tail, ctx)
 	p.ctxs[name] = ctx
+	p.rebuild()
 	return p
 }
 
@@ -137,6 +164,7 @@ func (p *defaultPipeline) Remove(name string) ChannelPipeline {
 	delete(p.ctxs, name)
 	ctx.prev.next = ctx.next
 	ctx.next.prev = ctx.prev
+	p.rebuild()
 	return p
 }
 

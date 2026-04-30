@@ -3,6 +3,7 @@ package frame
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 
 	"github.com/lufeijun/goTools/ws/buf"
@@ -284,3 +285,91 @@ func (w *writeBuf) ReaderIndex() int                   { return 0 }
 func (w *writeBuf) WriterIndex() int                   { return w.bb.Len() }
 func (w *writeBuf) SetReaderIndex(v int)               {}
 func (w *writeBuf) SetWriterIndex(v int)               {}
+
+func TestReadFrameFromBuf_TextUnmasked(t *testing.T) {
+	raw := []byte{0x81, 0x05, 'H', 'e', 'l', 'l', 'o'}
+	bb := buf.NewByteBuf(128)
+	bb.Write(raw)
+
+	f, err := ReadFrameFromBuf(bb, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.FIN {
+		t.Error("FIN = false, want true")
+	}
+	if f.Opcode != OpcodeText {
+		t.Errorf("Opcode = %d, want %d", f.Opcode, OpcodeText)
+	}
+	if string(f.Payload) != "Hello" {
+		t.Errorf("Payload = %q, want %q", string(f.Payload), "Hello")
+	}
+	// Reader index should be at end of frame.
+	if bb.ReaderIndex() != len(raw) {
+		t.Errorf("ReaderIndex = %d, want %d", bb.ReaderIndex(), len(raw))
+	}
+}
+
+func TestReadFrameFromBuf_Masked(t *testing.T) {
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	original := []byte("Hello")
+	masked := applyMask(original, key)
+
+	raw := []byte{0x81, 0x85}
+	raw = append(raw, key[:]...)
+	raw = append(raw, masked...)
+
+	bb := buf.NewByteBuf(128)
+	bb.Write(raw)
+
+	f, err := ReadFrameFromBuf(bb, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(f.Payload) != "Hello" {
+		t.Errorf("Payload = %q, want %q", string(f.Payload), "Hello")
+	}
+	if f.Masked {
+		t.Error("Masked = true, want false after unmask")
+	}
+}
+
+func TestReadFrameFromBuf_ShortBuffer(t *testing.T) {
+	raw := []byte{0x81, 0x05, 'H', 'e'}
+	bb := buf.NewByteBuf(128)
+	bb.Write(raw)
+
+	start := bb.ReaderIndex()
+	_, err := ReadFrameFromBuf(bb, DefaultMaxFrameSize)
+	if err != io.ErrShortBuffer {
+		t.Fatalf("expected io.ErrShortBuffer, got %v", err)
+	}
+	// Reader index should be rewound on failure.
+	if bb.ReaderIndex() != start {
+		t.Errorf("ReaderIndex = %d, want %d (rewound)", bb.ReaderIndex(), start)
+	}
+}
+
+func TestReadFrameFromBuf_MediumPayload(t *testing.T) {
+	payload := make([]byte, 200)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	var w bytes.Buffer
+	WriteFrame(&w, Frame{FIN: true, Opcode: OpcodeBinary, Payload: payload})
+
+	bb := buf.NewByteBuf(512)
+	bb.Write(w.Bytes())
+
+	f, err := ReadFrameFromBuf(bb, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Payload) != 200 {
+		t.Errorf("Payload len = %d, want 200", len(f.Payload))
+	}
+	if !bytes.Equal(f.Payload, payload) {
+		t.Error("Payload mismatch")
+	}
+}

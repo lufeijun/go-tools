@@ -1,6 +1,6 @@
 # ws/conn — 连接层
 
-`ws/conn` 是 WebSocket 连接的抽象层，定义了 `Conn` 接口和两种实现：`netConn`（基于标准 `net.Conn`）与 `epollConn`（基于事件驱动）。同时提供 RFC 6455 握手协议和帧编解码器。
+`ws/conn` 是 WebSocket 连接的抽象层，定义了 `Conn` 接口和两种实现：`netConn`（基于标准 `net.Conn`）与 `epollConn`（基于事件驱动）。同时提供 RFC 6455 握手协议、帧编解码器和 TCP 参数优化。
 
 ---
 
@@ -131,7 +131,7 @@ func (c *netConn) Write(b buf.ByteBuf) error {
 
 ### 2. epollConn（epollconn.go）
 
-基于原始 fd 的事件驱动实现，V2.0 为框架 stub，V2.1 完善非阻塞读写。
+基于原始 fd 的事件驱动实现，V2.0 框架已搭建，V2.1 完善非阻塞读写。
 
 ```go
 type epollConn struct {
@@ -146,9 +146,10 @@ type epollConn struct {
 ```
 
 当前状态：
-- `Read()` / `Write()` 为 TODO stub
-- `RemoteAddr()` / `LocalAddr()` 为 nil（TODO 从 fd 解析）
-- `OnEvent()` 为 TODO（V2.1 处理 read/write 事件）
+- `Read()` / `Write()` 已完成非阻塞 syscall 实现框架
+- `OnEvent()` 处理 read/write 事件
+- `Close()` 调用 `EventLoop.Deregister(fd)` + `syscall.Close(fd)`
+- V2.1 完善完整读写缓冲和 `EPOLLOUT` 写事件注册
 
 ---
 
@@ -163,6 +164,41 @@ func NextConnID() uint64 {
     return atomic.AddUint64(&connIDSeq, 1)
 }
 ```
+
+---
+
+## TCP 参数优化（P0 优化 3.2）
+
+`ws.go` 中定义了 `TCPNoDelay`、`TCPQuickAck`、`SOReusePort`，在 `handshake.go` / `server.go` / `client.go` 中已实际调用。
+
+### ApplyTCPOptions
+
+```go
+func ApplyTCPOptions(nc net.Conn, noDelay, quickAck bool) error
+```
+
+在 `ServerHandshake` / `ClientHandshake` 返回 conn 后设置：
+- `TCP_NODELAY` — 关闭 Nagle 算法，小帧立即发送
+- `TCP_QUICKACK` — Linux 禁用延迟确认，降低 RTT
+
+### ListenTCPWithReusePort
+
+```go
+func ListenTCPWithReusePort(addr string) (net.Listener, error)
+```
+
+使用 `golang.org/x/sys/unix.SO_REUSEPORT` 实现多进程监听同一端口：
+
+```go
+if cfg.SOReusePort {
+    listener, err = conn.ListenTCPWithReusePort(cfg.Addr)
+} else {
+    listener, err = net.Listen("tcp", cfg.Addr)
+}
+```
+
+- 内核在多个进程间做负载均衡
+- 配合 `TCP_NODELAY`，避免 Nagle + Delayed ACK 交互延迟
 
 ---
 
@@ -188,6 +224,7 @@ func ServerHandshake(w http.ResponseWriter, r *http.Request) (net.Conn, error)
 - 使用 `http.Hijacker` 接管底层 TCP 连接
 - 若 `bufio.Reader` 有缓冲数据，包装为 `drainConn` 先消费缓冲
 - 返回原始 `net.Conn`
+- 调用方负责 `ApplyTCPOptions`
 
 ### ClientHandshake
 
@@ -219,7 +256,7 @@ func computeAcceptKey(secKey string) string {
 
 ---
 
-## 帧编解码器（codec.go）
+## 帧编解码器：FrameCodec
 
 `FrameCodec` 是 `OutboundHandler`，将 `*conn.Message` 编码为 WebSocket 帧并写入底层连接。
 
@@ -252,6 +289,7 @@ func (fc *FrameCodec) Write(ctx pipeline.Context, msg interface{}) {
 
 - 服务端 `Masked = false`，客户端 `Masked = true`
 - 写入完成后继续往前传（`FireChannelWrite`），供其他 OutboundHandler 处理
+- `server.go`/`client.go` 在连接建立后自动将 `FrameCodec` 添加到 Pipeline
 
 ---
 
@@ -261,9 +299,10 @@ func (fc *FrameCodec) Write(ctx pipeline.Context, msg interface{}) {
 |---|---|
 | `conn.go` | `Conn`、`EventDrivenConn` 接口；`Message`；`NextConnID`；`ErrConnClosed` |
 | `netconn.go` | 标准 `net.Conn` 实现：`netConn` |
-| `epollconn.go` | 事件驱动实现 stub：`epollConn` |
+| `epollconn.go` | 事件驱动实现：`epollConn`（非阻塞 Read/Write + EPOLLOUT 注册） |
 | `handshake.go` | `ServerHandshake`、`ClientHandshake`、Accept Key 计算、`drainConn` |
 | `codec.go` | `FrameCodec`：OutboundHandler，将 `*Message` 编码为 WebSocket 帧 |
+| `tcp.go` | `ApplyTCPOptions`、`ListenTCPWithReusePort`（SO_REUSEPORT、TCP_NODELAY、TCP_QUICKACK） |
 | `conn_test.go` | netConn 读写/ID/Active/Close、握手验证、Accept Key 正确性、epollConn 接口合规 |
 
 ---
@@ -272,6 +311,7 @@ func (fc *FrameCodec) Write(ctx pipeline.Context, msg interface{}) {
 
 1. **netConn 是 V2.0 默认实现** — epollConn 的非阻塞读写在 V2.1 完善，当前生产环境使用 netConn
 2. **handshake 后返回原始 net.Conn** — Server/Client 负责将其包装为 `netConn` 或 `epollConn`
-3. **FrameCodec 必须加到 Pipeline 尾部** — `server.go`/`client.go` 在连接建立后自动添加
+3. **FrameCodec 自动加到 Pipeline** — `server.go`/`client.go` 在连接建立后自动添加
 4. **drainConn 处理 Hijack 后的缓冲数据** — 某些 HTTP 中间件会在 Hijack 前预读数据，`drainConn` 确保这些数据不丢失
 5. **ClientHandshake 支持 wss://** — 使用 `tls.Dial` 建立 TLS 连接
+6. **TCP 参数默认生效** — `TCPNoDelay` 默认 `true`，`TCPQuickAck` 默认 `false`，`SOReusePort` 默认 `false`

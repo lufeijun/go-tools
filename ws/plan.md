@@ -265,12 +265,13 @@
 | P2 | 5.4 | Pipeline ExceptionCaught 实现 | 调试体验 |
 | P2 | 5.5 | EventLoop.Stop 资源清理 | 资源泄漏 |
 | P2 | 5.6 | 客户端自动重连 | 客户端可用性 |
-| P3 | 1.3 | EventLoop 异步 dispatch | 需引入 goroutine pool，复杂度较高 |
-| P3 | 1.5 | Pipeline 预编译数组 | micro-optimization |
-| P3 | 2.4 | mask 原地 XOR | 有收益但需 careful 处理 ownership |
-| P3 | 2.5 | ByteBuf 扩容对齐 | 微优化 |
-| P3 | 5.7 | benchmark 基线 | 工程化 |
-| P3 | 5.8 | ByteBuf 线程安全文档 | 工程化 |
+| P3 | 1.3 | EventLoop 异步 dispatch | 需引入 goroutine pool，复杂度较高 | ✅ |
+| P3 | 1.5 | Pipeline 预编译数组 | micro-optimization | ✅ |
+| P3 | 2.2 | Peek+Skip 零拷贝帧解析 | 推广 ByteBuf 零拷贝模式 | ✅ |
+| P3 | 2.4 | mask 原地 XOR | 有收益但需 careful 处理 ownership | ✅ |
+| P3 | 2.5 | ByteBuf 扩容对齐 | 微优化 | ✅ |
+| P3 | 5.7 | benchmark 基线 | 工程化 | ✅ |
+| P3 | 5.8 | ByteBuf 线程安全文档 | 工程化 | ✅ |
 
 ---
 

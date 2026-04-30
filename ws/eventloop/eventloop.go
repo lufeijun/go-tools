@@ -2,6 +2,7 @@ package eventloop
 
 import (
 	"errors"
+	"runtime"
 	"sync/atomic"
 )
 
@@ -43,18 +44,69 @@ const (
 	EventHup
 )
 
+// workerPool is a fixed-size goroutine pool for dispatching handler events.
+type workerPool struct {
+	taskCh chan func()
+	stopCh chan struct{}
+}
+
+func newWorkerPool(workers int) *workerPool {
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	p := &workerPool{
+		taskCh: make(chan func(), 1024),
+		stopCh: make(chan struct{}),
+	}
+	for i := 0; i < workers; i++ {
+		go p.run()
+	}
+	return p
+}
+
+func (p *workerPool) run() {
+	for {
+		select {
+		case fn := <-p.taskCh:
+			fn()
+		case <-p.stopCh:
+			return
+		}
+	}
+}
+
+func (p *workerPool) submit(fn func()) {
+	select {
+	case p.taskCh <- fn:
+	case <-p.stopCh:
+	}
+}
+
+func (p *workerPool) stop() {
+	close(p.stopCh)
+}
+
 type defaultEventLoop struct {
 	poller      Poller
 	handlersVal atomic.Value // stores map[int]EventHandler
 	running     int32
 	stopCh      chan struct{}
+	pool        *workerPool
 }
 
 // NewEventLoop creates a new EventLoop backed by the given Poller.
+// It uses a goroutine pool sized to GOMAXPROCS for async handler dispatch.
 func NewEventLoop(p Poller) EventLoop {
+	return NewEventLoopWithPool(p, runtime.GOMAXPROCS(0))
+}
+
+// NewEventLoopWithPool creates a new EventLoop with a configurable worker pool size.
+// A workers value <= 0 defaults to GOMAXPROCS.
+func NewEventLoopWithPool(p Poller, workers int) EventLoop {
 	el := &defaultEventLoop{
 		poller: p,
 		stopCh: make(chan struct{}),
+		pool:   newWorkerPool(workers),
 	}
 	el.handlersVal.Store(make(map[int]EventHandler))
 	return el
@@ -133,7 +185,9 @@ func (el *defaultEventLoop) Run() error {
 		for _, e := range events {
 			h, ok := el.loadHandlers()[e.FD]
 			if ok {
-				h.OnEvent(e.FD, e.Events)
+				el.pool.submit(func() {
+					h.OnEvent(e.FD, e.Events)
+				})
 			}
 		}
 	}
@@ -145,6 +199,7 @@ func (el *defaultEventLoop) Stop() error {
 		return errors.New("not running")
 	}
 	close(el.stopCh)
+	el.pool.stop()
 
 	// Deregister all fds and close the poller.
 	handlers := el.loadHandlers()

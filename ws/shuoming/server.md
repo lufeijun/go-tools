@@ -82,7 +82,11 @@ func (s *defaultServer) Start() error {
     mux.HandleFunc("/", s.handleWebSocket)
 
     s.server = &http.Server{Handler: mux}
-    s.listener, err = net.Listen("tcp", s.config.Addr)
+    if s.config.SOReusePort {
+        s.listener, err = conn.ListenTCPWithReusePort(s.config.Addr)
+    } else {
+        s.listener, err = net.Listen("tcp", s.config.Addr)
+    }
     if err != nil {
         return err
     }
@@ -91,7 +95,7 @@ func (s *defaultServer) Start() error {
 ```
 
 1. 创建 `http.ServeMux`，注册 `/` 路径的 WebSocket 处理器
-2. 监听 TCP 地址
+2. 监听 TCP 地址（支持 SO_REUSEPORT）
 3. 调用 `http.Server.Serve()` 开始接受连接
 
 ---
@@ -112,16 +116,22 @@ func (s *defaultServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
         return
     }
 
-    // 3. 创建 netConn
+    // 3. 设置 TCP 参数（NODELAY / QUICKACK）
+    if err := conn.ApplyTCPOptions(nc, s.config.TCPNoDelay, s.config.TCPQuickAck); err != nil {
+        nc.Close()
+        return
+    }
+
+    // 4. 创建 netConn
     c := conn.NewNetConn(nc, false, conn.NextConnID())
 
-    // 4. 创建 Session
+    // 5. 创建 Session
     sess := session.NewSession(c, session.Config{
         PingInterval: s.config.PingInterval,
         PongTimeout:  s.config.PongTimeout,
     })
 
-    // 5. 启动心跳
+    // 6. 启动心跳（共享时间轮）
     hb := session.NewPerConnHeartbeater(s.config.PingInterval, s.config.PongTimeout)
     hb.SetOnTimeout(func() {
         sess.SetState(session.StateDisconnected)
@@ -130,23 +140,23 @@ func (s *defaultServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
     sess.SetState(session.StateConnected)
     hb.Start(sess)
 
-    // 6. 注册到 Hub
+    // 7. 注册到 Hub
     s.hub.Register(sess)
 
-    // 7. 添加帧编解码器
+    // 8. 添加帧编解码器
     sess.Conn().Pipeline().AddLast("codec", &conn.FrameCodec{Writer: nc, IsClient: false})
 
-    // 8. 触发连接回调
+    // 9. 触发连接回调
     if s.onConnect != nil {
         s.onConnect(sess)
     }
 
-    // 9. 启动读循环
+    // 10. 启动读循环
     go s.serveConn(sess, nc)
 }
 ```
 
-### serveConn 读循环
+### serveConn 读循环（P1 优化 3.3）
 
 ```go
 func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
@@ -155,8 +165,17 @@ func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
         s.hub.Unregister(sess.Conn().ID())
     }()
 
+    readTimeout := s.config.PongTimeout * 2
+    if readTimeout == 0 {
+        readTimeout = 120 * time.Second
+    }
+
+    // 64KB bufio 批量预读，减少 syscall 次数
+    br := bufio.NewReaderSize(nc, 65536)
+
     for {
-        f, err := frame.ReadFrame(nc)
+        nc.SetReadDeadline(time.Now().Add(readTimeout))
+        f, err := frame.ReadFrameLimit(br, s.config.MaxFrameSize)
         if err != nil {
             return
         }
@@ -170,6 +189,14 @@ func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
             _ = frame.WriteFrame(nc, frame.NewPongFrame(f.Payload))
 
         case frame.OpcodeClose:
+            // RFC 合规：回写 Close 帧再断开
+            code := uint16(1000)
+            reason := ""
+            if len(f.Payload) >= 2 {
+                code = binary.BigEndian.Uint16(f.Payload[:2])
+                reason = string(f.Payload[2:])
+            }
+            _ = frame.WriteFrame(nc, frame.NewCloseFrame(code, reason))
             return
         }
     }
@@ -178,10 +205,12 @@ func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
 
 **职责：**
 
-- 读取 WebSocket 帧
+- 使用 `bufio.Reader`（64KB）批量预读，帧解析从 3-5 次 syscall 降至 1 次
+- `ReadFrameLimit` 带 MaxFrameSize 校验，防止 DoS
 - Text/Binary 帧 → 构造 `conn.Message` → 触发 Pipeline 的 `FireChannelRead`
 - Ping 帧 → 自动回复 Pong 帧
-- Close 帧 → 退出循环，清理资源
+- Close 帧 → **回写 Close 响应帧**（RFC 6455 合规），然后退出循环清理资源
+- 读 deadline 防止 TCP 半开连接永不返回
 
 ---
 
@@ -197,6 +226,7 @@ srv.OnConnect(func(sess session.Session) {
 
 - 每个新连接都会触发此回调
 - 在回调中添加的 Handler 只对当前连接生效
+- 此时 FrameCodec 已添加到 Pipeline，业务 Handler 能看到已解码的 `conn.Message`
 
 ---
 
@@ -315,3 +345,5 @@ func main() {
 3. **Hub 自动注册，注销在 serveConn defer 中** — 连接断开时自动从 Hub 移除
 4. **Ping 自动回复 Pong** — 在 serveConn 中处理，不经过 Pipeline
 5. **MaxConnections 为 0 表示不限制** — 开启限制后，超限连接直接返回 503
+6. **TCP 参数默认生效** — `TCPNoDelay=true` 关闭 Nagle，`TCPQuickAck` 和 `SOReusePort` 按需开启
+7. **serveConn 使用 bufio 预读** — 64KB 缓冲，减少帧解析 syscall 次数
