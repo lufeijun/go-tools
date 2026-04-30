@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+
+	"github.com/lufeijun/goTools/ws/buf"
 )
 
 func TestWriteFrame_TextUnmasked(t *testing.T) {
@@ -239,3 +241,46 @@ func TestReadFrame_Fragmentation(t *testing.T) {
 		t.Errorf("Payload = %q, want %q", string(f.Payload), "Hello World")
 	}
 }
+
+func TestWriteFrameTo_TextUnmasked(t *testing.T) {
+	f := NewTextFrame([]byte("Hello"))
+	f.Masked = false
+
+	var bb bytes.Buffer
+	_ = WriteFrame(&bb, f)
+	expected := bb.Bytes()
+
+	// Reset and use WriteFrameTo.
+	bb.Reset()
+	dst := &writeBuf{bb: &bb}
+	_ = WriteFrameTo(dst, f)
+	if !bytes.Equal(bb.Bytes(), expected) {
+		t.Errorf("WriteFrameTo = %x, want %x", bb.Bytes(), expected)
+	}
+}
+
+// writeBuf is a minimal buf.ByteBuf wrapper for testing.
+type writeBuf struct {
+	bb *bytes.Buffer
+}
+
+func (w *writeBuf) ReadableBytes() int     { return w.bb.Len() }
+func (w *writeBuf) ReadBytes(n int) []byte { return nil }
+func (w *writeBuf) ReadAll() []byte        { return w.bb.Bytes() }
+func (w *writeBuf) Skip(n int)             {}
+func (w *writeBuf) Peek(n int) []byte      { return nil }
+func (w *writeBuf) WritableBytes() int     { return 1 << 30 }
+func (w *writeBuf) Write(p []byte) (int, error) {
+	return w.bb.Write(p)
+}
+func (w *writeBuf) WriteByte(b byte) error { return w.bb.WriteByte(b) }
+func (w *writeBuf) EnsureWritable(min int) {}
+func (w *writeBuf) Slice(start, length int) buf.ByteBuf { return nil }
+func (w *writeBuf) Retain() buf.ByteBuf                { return w }
+func (w *writeBuf) Release()                           {}
+func (w *writeBuf) RefCount() int                      { return 1 }
+func (w *writeBuf) Bytes() []byte                      { return w.bb.Bytes() }
+func (w *writeBuf) ReaderIndex() int                   { return 0 }
+func (w *writeBuf) WriterIndex() int                   { return w.bb.Len() }
+func (w *writeBuf) SetReaderIndex(v int)               {}
+func (w *writeBuf) SetWriterIndex(v int)               {}

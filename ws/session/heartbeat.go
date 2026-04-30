@@ -1,10 +1,22 @@
 package session
 
 import (
+	"sync"
 	"time"
 
 	"github.com/lufeijun/goTools/ws/conn"
 )
+
+// defaultTimingWheel is the package-level timing wheel shared by all
+// perConnHeartbeaters.  It is lazily started on first use.
+var defaultTimingWheel = NewTimingWheel(time.Second, 128)
+var twOnce sync.Once
+
+func ensureTimingWheel() {
+	twOnce.Do(func() {
+		defaultTimingWheel.Start()
+	})
+}
 
 // Heartbeater is the heartbeat interface.
 type Heartbeater interface {
@@ -13,51 +25,55 @@ type Heartbeater interface {
 	SetOnTimeout(fn func())
 }
 
-// perConnHeartbeater sends ping frames at regular intervals.
+// perConnHeartbeater sends ping frames at regular intervals using the
+// shared timing wheel instead of a dedicated goroutine per connection.
 type perConnHeartbeater struct {
 	pingInterval time.Duration
 	pongTimeout  time.Duration
-	stopChan     chan struct{}
 	onTimeout    func()
+
+	tw        *TimingWheel
+	pingTask  int64
+	stopOnce  sync.Once
 }
 
 // NewPerConnHeartbeater creates a per-connection heartbeater.
 func NewPerConnHeartbeater(pingInterval, pongTimeout time.Duration) Heartbeater {
+	ensureTimingWheel()
 	return &perConnHeartbeater{
 		pingInterval: pingInterval,
 		pongTimeout:  pongTimeout,
-		stopChan:     make(chan struct{}),
+		tw:           defaultTimingWheel,
 	}
 }
 
 func (h *perConnHeartbeater) Start(s Session) {
-	h.stopChan = make(chan struct{})
-	go h.run(s)
+	h.schedulePing(s)
 }
 
 func (h *perConnHeartbeater) Stop() {
-	select {
-	case h.stopChan <- struct{}{}:
-	default:
-	}
+	h.stopOnce.Do(func() {
+		if h.pingTask != 0 {
+			h.tw.Cancel(h.pingTask)
+		}
+	})
 }
 
 func (h *perConnHeartbeater) SetOnTimeout(fn func()) {
 	h.onTimeout = fn
 }
 
-func (h *perConnHeartbeater) run(s Session) {
-	ticker := time.NewTicker(h.pingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if s.Conn() != nil && s.Conn().Pipeline() != nil {
-				s.Conn().Pipeline().FireChannelWrite(&conn.Message{Type: 0x9})
-			}
-		case <-h.stopChan:
+func (h *perConnHeartbeater) schedulePing(s Session) {
+	if h.pingInterval <= 0 {
+		return
+	}
+	h.pingTask = h.tw.Add(h.pingInterval, func() {
+		// Guard against stopped heartbeater or closed session.
+		if s.Conn() == nil || s.Conn().Pipeline() == nil {
 			return
 		}
-	}
+		s.Conn().Pipeline().FireChannelWrite(&conn.Message{Type: 0x9})
+		// Re-schedule the next ping.
+		h.schedulePing(s)
+	})
 }

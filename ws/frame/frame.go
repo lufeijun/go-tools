@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/lufeijun/goTools/ws/buf"
 )
 
 type Opcode byte
@@ -208,4 +210,200 @@ func readFrameWithAccumulated(r io.Reader, maxPayload, accumulatedLen int) (Fram
 	}
 
 	return result, nil
+}
+
+// WriteFrameTo serializes a WebSocket frame into dst without allocating.
+// It is suitable for use with pooled ByteBufs.
+func WriteFrameTo(dst buf.ByteBuf, f Frame) error {
+	headerSize := 2
+	payloadLen := len(f.Payload)
+	switch {
+	case payloadLen <= 125:
+		// headerSize stays 2
+	case payloadLen <= 65535:
+		headerSize += 2
+	default:
+		headerSize += 8
+	}
+	if f.Masked {
+		headerSize += 4
+	}
+
+	dst.EnsureWritable(headerSize + payloadLen)
+
+	b1 := byte(f.Opcode)
+	if f.FIN {
+		b1 |= 0x80
+	}
+	if f.RSV1 {
+		b1 |= 0x40
+	}
+	if f.RSV2 {
+		b1 |= 0x20
+	}
+	if f.RSV3 {
+		b1 |= 0x10
+	}
+	dst.WriteByte(b1)
+
+	b2 := byte(0)
+	if f.Masked {
+		b2 |= 0x80
+	}
+
+	switch {
+	case payloadLen <= 125:
+		b2 |= byte(payloadLen)
+		dst.WriteByte(b2)
+	case payloadLen <= 65535:
+		b2 |= 126
+		dst.WriteByte(b2)
+		var lenBytes [2]byte
+		binary.BigEndian.PutUint16(lenBytes[:], uint16(payloadLen))
+		dst.Write(lenBytes[:])
+	default:
+		b2 |= 127
+		dst.WriteByte(b2)
+		var lenBytes [8]byte
+		binary.BigEndian.PutUint64(lenBytes[:], uint64(payloadLen))
+		dst.Write(lenBytes[:])
+	}
+
+	if f.Masked {
+		dst.Write(f.MaskKey[:])
+		dst.Write(applyMask(f.Payload, f.MaskKey))
+	} else if payloadLen > 0 {
+		dst.Write(f.Payload)
+	}
+
+	return nil
+}
+
+// ReadFrameBuf reads a single WebSocket frame using a pooled ByteBuf.
+// The returned Frame.Payload is backed by the returned ByteBuf; the caller
+// MUST Release the ByteBuf after the Frame is no longer needed.
+//
+// This is a zero-copy read path intended for callers that manage ByteBuf
+// lifetimes (e.g. Pipeline handlers).  For callers that do not use ByteBuf,
+// ReadFrameLimit is simpler and safer.
+func ReadFrameBuf(r io.Reader, pool buf.Pool, maxPayload int) (Frame, buf.ByteBuf, error) {
+	return readFrameBufWithAccumulated(r, pool, maxPayload, 0)
+}
+
+func readFrameBufWithAccumulated(r io.Reader, pool buf.Pool, maxPayload, accumulatedLen int) (Frame, buf.ByteBuf, error) {
+	var header [2]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return Frame{}, nil, err
+	}
+
+	var result Frame
+	result.FIN = header[0]&0x80 != 0
+	result.RSV1 = header[0]&0x40 != 0
+	result.RSV2 = header[0]&0x20 != 0
+	result.RSV3 = header[0]&0x10 != 0
+	result.Opcode = Opcode(header[0] & 0x0F)
+	result.Masked = header[1]&0x80 != 0
+	payloadLen := int(header[1] & 0x7F)
+
+	var extendedLen int
+	switch payloadLen {
+	case 126:
+		var b [2]byte
+		if _, err := io.ReadFull(r, b[:]); err != nil {
+			return Frame{}, nil, err
+		}
+		payloadLen = int(binary.BigEndian.Uint16(b[:]))
+		extendedLen = 2
+	case 127:
+		var b [8]byte
+		if _, err := io.ReadFull(r, b[:]); err != nil {
+			return Frame{}, nil, err
+		}
+		payloadLen = int(binary.BigEndian.Uint64(b[:]))
+		extendedLen = 8
+	}
+
+	if maxPayload > 0 && payloadLen > maxPayload {
+		return Frame{}, nil, &MaxFrameSizeError{Limit: maxPayload, Payload: payloadLen}
+	}
+
+	if result.Masked {
+		if _, err := io.ReadFull(r, result.MaskKey[:]); err != nil {
+			return Frame{}, nil, err
+		}
+	}
+
+	headerSize := 2 + extendedLen
+	if result.Masked {
+		headerSize += 4
+	}
+
+	bb := pool.Get(headerSize + payloadLen)
+	bb.Write(header[:])
+	if extendedLen == 2 {
+		var b [2]byte
+		binary.BigEndian.PutUint16(b[:], uint16(payloadLen))
+		bb.Write(b[:])
+	} else if extendedLen == 8 {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(payloadLen))
+		bb.Write(b[:])
+	}
+	if result.Masked {
+		bb.Write(result.MaskKey[:])
+	}
+
+	if payloadLen > 0 {
+		tmp := make([]byte, payloadLen)
+		if _, err := io.ReadFull(r, tmp); err != nil {
+			bb.Release()
+			return Frame{}, nil, err
+		}
+		if result.Masked {
+			tmp = applyMask(tmp, result.MaskKey)
+			result.Masked = false
+		}
+		bb.Write(tmp)
+	}
+
+	// Payload is the trailing bytes after the header.
+	result.Payload = bb.Peek(headerSize)
+	if len(result.Payload) > payloadLen {
+		result.Payload = result.Payload[:payloadLen]
+	}
+
+	if !result.FIN {
+		// Fragmented frame: read continuation frames and accumulate into
+		// a single ByteBuf.
+		firstOpcode := result.Opcode
+		totalLen := accumulatedLen + len(result.Payload)
+		if maxPayload > 0 && totalLen > maxPayload {
+			bb.Release()
+			return Frame{}, nil, &MaxFrameSizeError{Limit: maxPayload, Payload: totalLen}
+		}
+
+		for {
+			next, nextBB, err := readFrameBufWithAccumulated(r, pool, maxPayload, totalLen)
+			if err != nil {
+				bb.Release()
+				return Frame{}, nil, err
+			}
+			// Append next payload to bb.
+			bb.Write(next.Payload)
+			nextBB.Release()
+			totalLen += len(next.Payload)
+			if maxPayload > 0 && totalLen > maxPayload {
+				bb.Release()
+				return Frame{}, nil, &MaxFrameSizeError{Limit: maxPayload, Payload: totalLen}
+			}
+			if next.FIN {
+				result.FIN = true
+				result.Opcode = firstOpcode
+				result.Payload = bb.Bytes()[headerSize:]
+				break
+			}
+		}
+	}
+
+	return result, bb, nil
 }
