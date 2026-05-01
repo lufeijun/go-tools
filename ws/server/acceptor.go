@@ -70,7 +70,10 @@ func (a *netAcceptor) Listen(addr string) error {
 }
 
 func (a *netAcceptor) Accept() (conn.Conn, net.Conn, error) {
-	ac := <-a.connCh
+	ac, ok := <-a.connCh
+	if !ok {
+		return nil, nil, net.ErrClosed
+	}
 	return ac.c, ac.nc, nil
 }
 

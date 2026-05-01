@@ -8,11 +8,14 @@ import (
 )
 
 func TestServer_New(t *testing.T) {
-	srv := NewServer(ws.Config{
+	srv, err := NewServer(ws.Config{
 		Addr:         "127.0.0.1:0",
 		PingInterval: 30 * time.Second,
 		PongTimeout:  60 * time.Second,
 	})
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
+	}
 	if srv == nil {
 		t.Fatal("NewServer returned nil")
 	}
@@ -22,11 +25,14 @@ func TestServer_New(t *testing.T) {
 }
 
 func TestServer_StartStop(t *testing.T) {
-	srv := NewServer(ws.Config{
+	srv, err := NewServer(ws.Config{
 		Addr:         "127.0.0.1:0",
 		PingInterval: 30 * time.Second,
 		PongTimeout:  60 * time.Second,
 	})
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
+	}
 
 	go srv.Start()
 	time.Sleep(100 * time.Millisecond)
