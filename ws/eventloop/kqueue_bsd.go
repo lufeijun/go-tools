@@ -18,6 +18,11 @@ func newKqueuePoller() Poller {
 	return &kqueuePoller{}
 }
 
+// NewKqueuePoller creates a new kqueue-based Poller.
+func NewKqueuePoller() Poller {
+	return newKqueuePoller()
+}
+
 func (p *kqueuePoller) Open() error {
 	fd, err := unix.Kqueue()
 	if err != nil {

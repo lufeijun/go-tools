@@ -18,6 +18,11 @@ func newEpollPoller() Poller {
 	return &epollPoller{}
 }
 
+// NewEpollPoller creates a new epoll-based Poller.
+func NewEpollPoller() Poller {
+	return newEpollPoller()
+}
+
 func (p *epollPoller) Open() error {
 	fd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
