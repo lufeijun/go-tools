@@ -109,6 +109,7 @@ func NewEventLoopWithPool(p Poller, workers int) EventLoop {
 		pool:   newWorkerPool(workers),
 	}
 	el.handlersVal.Store(make(map[int]EventHandler))
+	el.poller.Open()
 	return el
 }
 
@@ -165,10 +166,6 @@ func (el *defaultEventLoop) Run() error {
 		return errors.New("already running")
 	}
 	defer atomic.StoreInt32(&el.running, 0)
-
-	if err := el.poller.Open(); err != nil {
-		return err
-	}
 
 	for {
 		select {
