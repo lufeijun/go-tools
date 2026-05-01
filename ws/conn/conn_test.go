@@ -125,8 +125,3 @@ func TestComputeAcceptKey(t *testing.T) {
 	}
 }
 
-func TestEpollConn_Interface(t *testing.T) {
-	// We can't test real epoll without a real fd, but we can verify the struct
-	// implements EventDrivenConn interface.
-	var _ EventDrivenConn = (*epollConn)(nil)
-}

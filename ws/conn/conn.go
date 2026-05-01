@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/lufeijun/goTools/ws/buf"
+	"github.com/lufeijun/goTools/ws/frame"
 	"github.com/lufeijun/goTools/ws/pipeline"
 )
 
@@ -37,6 +38,7 @@ type EventDrivenConn interface {
 	FD() int
 	OnEvent(events uint32)
 	SetEventLoop(el interface{})
+	SetOnFrame(fn func(frame.Frame))
 }
 
 var connIDSeq uint64
