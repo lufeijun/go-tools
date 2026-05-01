@@ -61,7 +61,10 @@ func main() {
 		PongTimeout:  60 * time.Second,
 	}
 
-	srv := server.NewServer(cfg)
+	srv, err := server.NewServer(cfg)
+	if err != nil {
+		log.Fatal("创建服务端失败:", err)
+	}
 
 	// 每 5 秒打印一次当前连接数
 	go func() {

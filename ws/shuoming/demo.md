@@ -101,7 +101,10 @@ func main() {
         PingInterval: 30 * time.Second,
         PongTimeout:  60 * time.Second,
     }
-    srv := server.NewServer(cfg)
+    srv, err := server.NewServer(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
 
     // 定时打印在线人数
     go func() {
@@ -120,19 +123,15 @@ func main() {
     })
 
     log.Println("服务端启动，监听 :8080 ...")
-    go func() {
-        if err := srv.Start(); err != nil {
-            log.Fatal(err)
-        }
-    }()
+    if err := srv.Start(); err != nil {
+        log.Fatal(err)
+    }
 
     // 优雅关闭
     quit := make(chan os.Signal, 1)
     signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
     <-quit
 
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
     srv.Stop()
     log.Println("服务端已停止")
 }
@@ -174,7 +173,14 @@ func main() {
         PingInterval: 30 * time.Second,
         PongTimeout:  60 * time.Second,
     }
-    c := client.NewClient(cfg)
+    c, err := client.NewClient(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if err := c.Connect(); err != nil {
+        log.Fatal("连接失败:", err)
+    }
 
     // 状态监听
     go func() {
@@ -194,10 +200,6 @@ func main() {
             }
         }
     }()
-
-    if err := c.Connect(); err != nil {
-        log.Fatal("连接失败:", err)
-    }
 
     c.Session().Conn().Pipeline().AddLast("print", &PrintHandler{})
 
@@ -245,7 +247,183 @@ func main() {
 
 ---
 
-## 示例 2：聊天室（Hub 广播 + userID 绑定）
+## 示例 2：Epoll 模式 Echo（仅 Linux）
+
+在 Linux 上使用 epoll Reactor 模式运行 Echo 服务端，支持更高并发：
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+
+    "github.com/lufeijun/goTools/ws"
+    "github.com/lufeijun/goTools/ws/conn"
+    "github.com/lufeijun/goTools/ws/pipeline"
+    "github.com/lufeijun/goTools/ws/server"
+    "github.com/lufeijun/goTools/ws/session"
+)
+
+type EchoHandler struct{}
+
+func (h *EchoHandler) Name() string { return "echo" }
+
+func (h *EchoHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
+    m, ok := msg.(*conn.Message)
+    if !ok || m.Type != byte(0x1) {
+        ctx.FireChannelRead(msg)
+        return
+    }
+    serverTime := time.Now().Format("2006-01-02 15:04:05.000")
+    reply := fmt.Sprintf("服务端时间 %s | 客户端内容: %s", serverTime, string(m.Data))
+    ctx.Write(&conn.Message{Type: m.Type, Data: []byte(reply)})
+    ctx.FireChannelRead(msg)
+}
+
+func (h *EchoHandler) ChannelActive(ctx pipeline.Context)   { ctx.FireChannelActive() }
+func (h *EchoHandler) ChannelInactive(ctx pipeline.Context) { ctx.FireChannelInactive() }
+func (h *EchoHandler) ExceptionCaught(ctx pipeline.Context, err error) {}
+
+func main() {
+    // 关键：设置 Mode 为 ws.ModeEpoll
+    cfg := ws.Config{
+        Mode:             ws.ModeEpoll,
+        Addr:             ":8080",
+        PingInterval:     30 * time.Second,
+        PongTimeout:      60 * time.Second,
+        EventLoopWorkers: 0,   // 0 表示自动使用 CPU 核数
+    }
+    srv, err := server.NewServer(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    go func() {
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+            if count := srv.Hub().Count(); count > 0 {
+                log.Printf("当前在线: %d\n", count)
+            }
+        }
+    }()
+
+    srv.OnConnect(func(sess session.Session) {
+        sess.Conn().Pipeline().AddLast("echo", &EchoHandler{})
+    })
+
+    log.Println("Epoll 服务端启动，监听 :8080 ...")
+    if err := srv.Start(); err != nil {
+        log.Fatal(err)
+    }
+
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+
+    srv.Stop()
+    log.Println("服务端已停止")
+}
+```
+
+**Epoll 模式客户端：**
+
+```go
+package main
+
+import (
+    "bufio"
+    "fmt"
+    "log"
+    "os"
+    "time"
+
+    "github.com/lufeijun/goTools/ws"
+    "github.com/lufeijun/goTools/ws/client"
+    "github.com/lufeijun/goTools/ws/conn"
+    "github.com/lufeijun/goTools/ws/pipeline"
+    "github.com/lufeijun/goTools/ws/session"
+)
+
+type PrintHandler struct{}
+
+func (h *PrintHandler) Name() string { return "print" }
+
+func (h *PrintHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
+    m, ok := msg.(*conn.Message)
+    if !ok || m.Type != 0x1 {
+        ctx.FireChannelRead(msg)
+        return
+    }
+    fmt.Printf("收到: %s\n", string(m.Data))
+    ctx.FireChannelRead(msg)
+}
+
+func main() {
+    // 关键：设置 Mode 为 ws.ModeEpoll
+    cfg := ws.Config{
+        Mode:              ws.ModeEpoll,
+        Addr:              "ws://localhost:8080/",
+        PingInterval:      30 * time.Second,
+        PongTimeout:       60 * time.Second,
+        ReconnectInterval: 5 * time.Second,
+        MaxReconnect:      5,
+    }
+    c, err := client.NewClient(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if err := c.Connect(); err != nil {
+        log.Fatal("连接失败:", err)
+    }
+
+    c.OnConnect(func(sess session.Session) {
+        sess.Conn().Pipeline().AddLast("print", &PrintHandler{})
+    })
+
+    go func() {
+        sess := c.Session()
+        if sess == nil { return }
+        for st := range sess.StateChan() {
+            switch st {
+            case session.StateConnected:
+                fmt.Println("【状态】已连接")
+            case session.StateDisconnected:
+                fmt.Println("【状态】已断开")
+            case session.StateClosed:
+                fmt.Println("【状态】连接已关闭")
+                return
+            }
+        }
+    }()
+
+    fmt.Println("已连接到服务端，输入消息并按回车发送（输入 exit 退出）")
+    fmt.Print("请输入消息: ")
+
+    scanner := bufio.NewScanner(os.Stdin)
+    for scanner.Scan() {
+        text := scanner.Text()
+        if text == "exit" {
+            c.Close()
+            return
+        }
+        c.Session().Conn().Pipeline().FireChannelWrite(
+            &conn.Message{Type: 0x1, Data: []byte(text)})
+    }
+}
+```
+
+**注意：** Epoll 模式仅在 Linux 上可用。在非 Linux 平台运行时，`NewServer` 或 `NewClient` 会返回错误。
+
+---
+
+## 示例 3：聊天室（Hub 广播 + userID 绑定）
 
 `demo/chat/` 演示聊天室场景：
 
@@ -285,3 +463,4 @@ func (um *UserManager) SendTo(userID string, msg conn.Message) {
 2. **自定义 Handler** — 在 Pipeline 中添加认证、限流、日志等 Handler
 3. **状态机扩展** — 利用 `StateChan` 做断线重连提示、连接质量监控
 4. **性能测试** — 使用 `ws/hub` 的 benchmark 测试广播性能
+5. **Epoll 压测** — 在 Linux 上使用 `ws.ModeEpoll` 进行高并发压测（10 万+ 连接）

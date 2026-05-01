@@ -1,6 +1,6 @@
 # ws — 根包
 
-`ws` 是框架的根包，提供**统一错误体系**和**全局配置**，被 `server`、`client` 及所有子包共享。
+`ws` 是框架的根包，提供**统一错误体系**、**全局配置**和**I/O 模式选择**，被 `server`、`client` 及所有子包共享。
 
 ---
 
@@ -64,6 +64,118 @@ if errors.Is(e, io.EOF) {
 
 ---
 
+## IOMode — I/O 模式选择
+
+v2 引入 `IOMode` 类型，用于选择连接的 I/O 处理模型。
+
+### 类型定义
+
+```go
+// IOMode determines the connection I/O model.
+type IOMode int
+
+const (
+    // ModeNet uses net.Conn with goroutine-per-conn (default).
+    // 使用 Go 标准库 net.Conn，每个连接一个 goroutine 处理读循环。
+    // 所有平台可用。零值即为 ModeNet，无需显式设置。
+    ModeNet IOMode = iota
+
+    // ModeEpoll uses epollConn with event-driven Reactor model (Linux only).
+    // 使用原始 fd + epoll 的事件驱动 Reactor 模型，数据由 EventLoop 驱动读取。
+    // 仅 Linux 可用。目标：10 万–100 万并发连接，近零空闲 goroutine 开销。
+    ModeEpoll
+)
+```
+
+### 两种模式对比
+
+| 方面 | ModeNet（默认） | ModeEpoll |
+|---|---|---|
+| I/O 模型 | goroutine-per-conn | 事件驱动 Reactor |
+| 连接类型 | `netConn`（包装 `net.Conn`） | `epollConn`（包装原始 fd） |
+| 读循环 | 每个 goroutine 独立 bufio 读循环 | EventLoop 统一驱动，通过 onFrame 回调分发 |
+| 空闲开销 | 每连接一个 goroutine（约 8KB 栈） | 近零（无 goroutine 空闲等待） |
+| 适用场景 | 中等并发（万级连接） | 高并发（10 万–100 万连接） |
+| 平台支持 | 所有平台 | 仅 Linux |
+| 握手方式 | `ServerHandshake`（Hijack）/ `ClientHandshake`（net.Dial） | `ServerHandshakeFD` / `ClientHandshakeFD`（原始 fd 操作） |
+
+### 使用方式
+
+```go
+// 默认模式（ModeNet），无需设置 Mode 字段
+cfg := ws.Config{
+    Addr:         ":8080",
+    PingInterval: 30 * time.Second,
+}
+
+// Epoll 模式（仅 Linux），显式设置 Mode
+cfg := ws.Config{
+    Mode:         ws.ModeEpoll,
+    Addr:         ":8080",
+    PingInterval: 30 * time.Second,
+}
+```
+
+**零值即 ModeNet：** `IOMode` 的零值是 `ModeNet`（值为 0），所以如果不设置 `Mode` 字段，默认就是 Net 模式。大多数用户不需要关心 `Mode` 字段。
+
+---
+
+## ValidateMode — 模式校验
+
+```go
+func (c Config) ValidateMode() error
+```
+
+校验 `Config.Mode` 是否在当前平台上可用。
+
+### 规则
+
+- `ModeNet`：所有平台通过，返回 nil
+- `ModeEpoll`：仅 Linux 通过；在非 Linux 平台返回错误
+
+```go
+func (c Config) ValidateMode() error {
+    if c.Mode == ModeEpoll && runtime.GOOS != "linux" {
+        return fmt.Errorf("epoll mode is only supported on Linux, current OS: %s", runtime.GOOS)
+    }
+    return nil
+}
+```
+
+### 自动调用
+
+`ValidateMode()` 会被 `NewServer` 和 `NewClient` 自动调用，无需手动检查：
+
+```go
+// NewServer 内部
+func NewServer(cfg ws.Config) (Server, error) {
+    if err := cfg.ValidateMode(); err != nil {
+        return nil, err   // 非 Linux 上使用 ModeEpoll 会在这里返回错误
+    }
+    // ... 创建服务端
+}
+
+// NewClient 内部
+func NewClient(cfg ws.Config) (Client, error) {
+    if err := cfg.ValidateMode(); err != nil {
+        return nil, err   // 非 Linux 上使用 ModeEpoll 会在这里返回错误
+    }
+    // ... 创建客户端
+}
+```
+
+**因此，你只需要检查 `NewServer` / `NewClient` 的返回错误即可：**
+
+```go
+srv, err := server.NewServer(ws.Config{Mode: ws.ModeEpoll, Addr: ":8080"})
+if err != nil {
+    // 在非 Linux 平台上，err 会是 "epoll mode is only supported on Linux, current OS: darwin"
+    log.Fatal(err)
+}
+```
+
+---
+
 ## Config — 全局配置
 
 `Config` 是 Server 和 Client 的通用配置结构体，零值表示"使用默认值"。
@@ -89,6 +201,7 @@ type Config struct {
     Headers           http.Header   // Client 握手时附加的 HTTP 头
     ReconnectInterval time.Duration // Client 断线后重连初始间隔，默认 5s
     MaxReconnect      int           // Client 最大重连次数，默认 5
+    Mode              IOMode        // I/O 模式：ModeNet（默认）或 ModeEpoll（Linux 专属）
 }
 ```
 
@@ -118,8 +231,11 @@ Config{
     EnableCompression: false,
     ReconnectInterval: 5 * time.Second,
     MaxReconnect:      5,
+    // Mode 未设置，零值为 ModeNet（默认模式）
 }
 ```
+
+**注意：** `DefaultConfig()` 返回的配置中 `Mode` 字段为零值（`ModeNet`），这是有意为之的 — 大多数用户使用 Net 模式即可，不需要显式设置。
 
 ### EventLoopWorkerCount
 
@@ -136,7 +252,7 @@ func (c Config) EventLoopWorkerCount() int
 ## 配置使用模式
 
 ```go
-// 模式 1：完全自定义
+// 模式 1：完全自定义（Mode 为零值，即 ModeNet）
 cfg := ws.Config{
     Addr:         ":8080",
     PingInterval: 60 * time.Second,
@@ -149,7 +265,25 @@ cfg.MaxConnections = 100000
 cfg.PingInterval = 60 * time.Second
 
 // 模式 3：Server/Client 自动填充零值
-srv := server.NewServer(ws.Config{Addr: ":8080"})  // 其他字段自动使用默认值
+srv, err := server.NewServer(ws.Config{Addr: ":8080"})  // 其他字段自动使用默认值
+if err != nil {
+    log.Fatal(err)
+}
+
+// 模式 4：Epoll 模式（仅 Linux）
+cfg := ws.Config{
+    Mode:         ws.ModeEpoll,
+    Addr:         ":8080",
+}
+srv, err := server.NewServer(cfg)
+if err != nil {
+    log.Fatal(err)  // 非 Linux 平台会在这里报错
+}
+
+// 模式 5：手动校验模式（可选，NewServer/NewClient 会自动调用）
+if err := cfg.ValidateMode(); err != nil {
+    log.Fatal("I/O 模式不支持:", err)
+}
 ```
 
 ---
@@ -158,16 +292,18 @@ srv := server.NewServer(ws.Config{Addr: ":8080"})  // 其他字段自动使用�
 
 | 文件 | 内容 |
 |---|---|
-| `ws.go` | `WSError`、`Config`、`DefaultConfig`、`EventLoopWorkerCount`、预定义错误码 |
-| `ws_test.go` | WSError 格式化/Unwrap/WithConnID、DefaultConfig 各字段默认值测试 |
+| `ws.go` | `WSError`、`IOMode`、`ModeNet`/`ModeEpoll` 常量、`Config`（含 `Mode` 字段）、`DefaultConfig`、`ValidateMode`、`EventLoopWorkerCount`、预定义错误码 |
+| `ws_test.go` | WSError 格式化/Unwrap/WithConnID、DefaultConfig 各字段默认值测试、ValidateMode 测试 |
 
 ---
 
 ## 注意事项
 
 1. **WSError 不可变** — `WithConnID` 返回新实例，不修改原实例
-2. **Config 零值有语义** — `EventLoopWorkers = 0` 表示自动，不是"不启用"
-3. **BufferPool 数字表示对象数** — 不是字节数，而是各自 tier 的 `sync.Pool` 预分配对象数量
-4. **MaxFrameSize 防止内存攻击** — 收到超过此值的帧直接报错断开，建议根据业务调整（如 16MB）
-5. **根包不依赖任何子包** — 确保 `server`/`client` 等子包可以安全 import `ws` 根包
-6. **TCPNoDelay 默认 true** — 生产环境建议保持开启，避免 Nagle 算法导致的小帧延迟
+2. **Config 零值有语义** — `EventLoopWorkers = 0` 表示自动，不是"不启用"；`Mode` 零值为 `ModeNet`
+3. **ModeEpoll 仅 Linux 可用** — `ValidateMode()` 和 `NewServer`/`NewClient` 都会校验，非 Linux 使用 `ModeEpoll` 会返回错误
+4. **BufferPool 数字表示对象数** — 不是字节数，而是各自 tier 的 `sync.Pool` 预分配对象数量
+5. **MaxFrameSize 防止内存攻击** — 收到超过此值的帧直接报错断开，建议根据业务调整（如 16MB）
+6. **根包不依赖任何子包** — 确保 `server`/`client` 等子包可以安全 import `ws` 根包
+7. **TCPNoDelay 默认 true** — 生产环境建议保持开启，避免 Nagle 算法导致的小帧延迟
+8. **NewServer/NewClient 返回 error** — 必须检查返回的错误，特别是在使用 `ModeEpoll` 时

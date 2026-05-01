@@ -32,9 +32,11 @@ type Session interface {
 |---|---|
 | `Conn()` | 获取底层连接对象 |
 | `State()` | 获取当前状态 |
-| `StateChan()` | 状态变化通知通道（只读） |
-| `SetState()` | 设置新状态，并通知 StateChan |
-| `Close()` | 关闭会话，状态变为 Closed，关闭 stateChan |
+| `StateChan()` | 创建一个新的状态订阅通道（只读），每次调用创建独立订阅 |
+| `SetState()` | 设置新状态，并向所有订阅者广播 |
+| `Close()` | 关闭会话，状态变为 Closed，关闭所有订阅通道 |
+
+> **重要：** `StateChan()` 是**发布/订阅模式**，不是单一共享 channel。每次调用创建独立订阅。详见下文。
 
 ### State（状态枚举）
 
@@ -56,16 +58,16 @@ const (
 初始: Disconnected
 
       Connect() 被调用
-            │
-            ▼
-      Connecting ──失败──► Reconnecting ◄─────┐
-            │                │   ▲             │
-            │ 成功           │   │ 重试间隔后  │ 达到 MaxReconnect
-            ▼                │   │             │
-       Connected ──断开──►──┘   └─────────────┘
-            │                                    │
-            │ 调用 Close()                       ▼
-            ▼                              Closed
+            |
+            v
+      Connecting --失败--> Reconnecting <------+
+            |                |   ^              | 达到 MaxReconnect
+            | 成功           |   | 重试间隔后  |
+            v                |   |              |
+       Connected --断开---->+   +--------------+
+            |                                    |
+            | 调用 Close()                       v
+            v                              Closed
       Disconnected
 ```
 
@@ -73,58 +75,179 @@ const (
 
 ## 默认实现：defaultSession
 
+### 结构体
+
 ```go
 type defaultSession struct {
-    conn      conn.Conn
-    config    Config
-    stateChan chan State
-    state     State
-    closed    atomic.Bool
+    conn   conn.Conn
+    config Config
+    state  State
+    closed int32         // 原子标志，保证 Close 只执行一次
+
+    mu       sync.Mutex
+    subs     map[chan State]struct{}   // 所有订阅者
 }
 ```
 
-**构造：**
+**关键变化（v2 最新）：**
+
+- 旧版：`stateChan chan State` — 单一共享 channel，只有一个 goroutine 能监听
+- 新版：`subs map[chan State]struct{}` — **发布/订阅模式**，支持多个 goroutine 独立监听
+
+### 构造
 
 ```go
-func NewSession(c conn.Conn, cfg Config) Session
+func NewSession(c conn.Conn, cfg Config) Session {
+    return &defaultSession{
+        conn:   c,
+        config: cfg,
+        subs:   make(map[chan State]struct{}),
+    }
+}
 ```
 
-**状态通知：**
+- 初始化时 `subs` 为空 map，没有任何订阅者
+- 调用 `StateChan()` 时才创建订阅通道并注册
+
+### StateChan()：创建独立订阅
+
+```go
+func (s *defaultSession) StateChan() <-chan State {
+    ch := make(chan State, 16)       // 创建新的订阅通道，容量 16
+    s.mu.Lock()
+    s.subs[ch] = struct{}{}          // 注册到订阅者列表
+    // 立即向新订阅者投递当前状态，避免错过最新状态
+    if s.state != StateDisconnected {
+        select {
+        case ch <- s.state:
+        default:
+        }
+    }
+    s.mu.Unlock()
+    return ch
+}
+```
+
+**行为详解：**
+
+1. **每次调用都创建新的 `chan State`** — 不同 goroutine 各自调用 `StateChan()` 得到独立通道
+2. **容量 16** — 缓冲最近 16 个状态变化，满时丢弃，避免阻塞发送方
+3. **立即投递当前状态** — 新订阅者不会错过在订阅前已经发生的状态变化
+4. **互不影响** — 一个 goroutine 消费慢不影响其他 goroutine 的接收
+
+> **StateChan 是发布/订阅模式，不是单一共享 channel。每次调用创建独立订阅。**
+
+**典型用法：**
+
+```go
+// goroutine A：监听状态变化，打印日志
+go func() {
+    for state := range sess.StateChan() {
+        log.Println("状态变化:", state)
+    }
+}()
+
+// goroutine B：监听状态变化，触发业务逻辑
+go func() {
+    for state := range sess.StateChan() {
+        if state == session.StateConnected {
+            // 重新发送订阅等恢复逻辑
+        }
+    }
+}()
+```
+
+两个 goroutine 各自拥有独立的订阅通道，互不干扰。
+
+### SetState()：广播到所有订阅者
 
 ```go
 func (s *defaultSession) SetState(st State) {
-    s.state = st
-    select {
-    case s.stateChan <- st:  // 非阻塞写入
-    default:
+    if atomic.LoadInt32(&s.closed) == 1 {
+        return   // 已关闭的 session 不再接受状态变化
     }
+    s.state = st
+    s.mu.Lock()
+    for ch := range s.subs {
+        select {
+        case ch <- st:     // 非阻塞发送
+        default:
+                        // 通道满时丢弃，不阻塞
+        }
+    }
+    s.mu.Unlock()
 }
 ```
 
-- `stateChan` 容量为 16，缓冲最近的状态变化
-- 满时丢弃旧状态，避免阻塞发送方
+**行为详解：**
 
-**Close：**
+1. **遍历所有订阅者** — 将新状态发送到每一个已注册的通道
+2. **非阻塞发送** — 使用 `select + default`，如果某个通道满了就跳过
+3. **已关闭则忽略** — 通过 `atomic.LoadInt32(&s.closed)` 检查，避免在 Close 后继续操作
+
+### Close()：关闭所有订阅者
 
 ```go
 func (s *defaultSession) Close() error {
-    if s.closed.CompareAndSwap(false, true) {
+    if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
         s.state = StateClosed
-        close(s.stateChan)
+        s.mu.Lock()
+        for ch := range s.subs {
+            // 向每个订阅者发送 StateClosed，确保他们能收到关闭通知
+            select {
+            case ch <- StateClosed:
+            default:
+            }
+            close(ch)   // 关闭通道，range 循环会退出
+        }
+        s.subs = make(map[chan State]struct{})  // 清空订阅者列表
+        s.mu.Unlock()
     }
-    if s.conn != nil {
-        return s.conn.Close()
-    }
-    return nil
+    return s.conn.Close()
 }
 ```
 
-- 直接设置 `StateClosed` 并关闭 `stateChan`，防止监听它的 goroutine 永远阻塞
-- 同时关闭底层 `conn`
+**行为详解：**
+
+1. **先发送 StateClosed** — 确保所有订阅者收到关闭信号
+2. **再关闭通道** — `close(ch)` 使得 `for range ch` 循环正常退出
+3. **清空 subs** — 防止残留引用
+4. **CAS 保护** — `CompareAndSwapInt32` 保证 Close 只执行一次
+5. **关闭底层 conn** — 最后调用 `s.conn.Close()`
+
+> **监听 StateChan 的 goroutine 如何退出：** 当 `Close()` 被调用后，通道被关闭，`for range ch` 循环会在读完缓冲数据后自然退出。
 
 ---
 
-## 心跳：Heartbeater（P0 优化 5.1 + P1 优化 1.1）
+## onClose 回调与 epoll 模式
+
+在 epoll 模式下，`EpollConn` 提供了 `onClose` 回调机制：
+
+```go
+// server.go 中的 setupEpollFrameCallback
+func (s *defaultServer) setupEpollFrameCallback(c conn.Conn, sess session.Session) {
+    if edc, ok := c.(conn.EventDrivenConn); ok {
+        edc.SetOnClose(func() {
+            sess.SetState(session.StateDisconnected)
+        })
+        // ...
+    }
+}
+```
+
+**触发链路：**
+
+1. `EpollConn` 检测到连接断开（收到 EPOLLHUP/EPOLLERR 事件，或 read 返回 0）
+2. `EpollConn.closeLocked()` 被调用，执行 `c.onClose()`
+3. `onClose` 回调触发 `sess.SetState(session.StateDisconnected)`
+4. `SetState` 将 `StateDisconnected` 广播到所有 `StateChan()` 订阅者
+5. `serveConn` 的 `for range sess.StateChan()` 循环收到 `StateDisconnected`，退出
+
+**为什么需要 onClose：** 在 epoll 模式下，`serveConn` 不再阻塞在 `frame.ReadFrame` 上，而是等待 `StateChan` 的信号。`onClose` 回调是 EventLoop 通知 Session 层连接已断开的桥梁。
+
+---
+
+## 心跳：Heartbeater
 
 ### 接口
 
@@ -209,7 +332,7 @@ hb.SetOnTimeout(func() {
 
 ---
 
-## 自动重连：Reconnector（P2 优化 5.6）
+## 自动重连：Reconnector
 
 ### 接口
 
@@ -254,7 +377,7 @@ func (r *reconnector) Start(s Session) {
         c, err := r.dial()
         if err != nil {
             s.SetState(StateReconnecting)
-            // 指数退避：1s → 2s → 4s ... 最大 60s
+            // 指数退避：1s -> 2s -> 4s ... 最大 60s
             if backoff < 60*time.Second {
                 backoff *= 2
             }
@@ -322,6 +445,8 @@ type Config struct {
 
 ## 使用示例：监听状态变化
 
+### 基本用法
+
 ```go
 package main
 
@@ -332,10 +457,20 @@ import (
 )
 
 func main() {
-    c := client.NewClient(cfg)
-    c.Connect()
+    cfg := ws.DefaultConfig()
+    cfg.Addr = "ws://localhost:8080/"
+
+    c, err := client.NewClient(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := c.Connect(); err != nil {
+        log.Fatal(err)
+    }
 
     sess := c.Session()
+
+    // 监听状态变化 — 每次调用 StateChan() 创建独立订阅
     go func() {
         for state := range sess.StateChan() {
             switch state {
@@ -356,13 +491,42 @@ func main() {
 }
 ```
 
+### 多个 goroutine 各自监听
+
+```go
+// 日志 goroutine
+go func() {
+    for state := range sess.StateChan() {  // 创建订阅 A
+        log.Println("[日志] 状态变化:", state)
+        if state == session.StateClosed {
+            return
+        }
+    }
+}()
+
+// 业务恢复 goroutine
+go func() {
+    for state := range sess.StateChan() {  // 创建订阅 B（独立通道）
+        if state == session.StateConnected {
+            // 重连成功，恢复业务
+            resubscribe()
+        }
+        if state == session.StateClosed {
+            return
+        }
+    }
+}()
+```
+
+**关键点：** 两次 `StateChan()` 调用返回不同的通道，两个 goroutine 互不影响。一个通道消费慢不会导致另一个通道阻塞或丢失消息。
+
 ---
 
 ## 文件清单
 
 | 文件 | 内容 |
 |---|---|
-| `session.go` | `Session` 接口、`State` 枚举、`defaultSession` 实现 |
+| `session.go` | `Session` 接口、`State` 枚举、`defaultSession` 实现（发布/订阅模式） |
 | `heartbeat.go` | `Heartbeater` 接口、`perConnHeartbeater` 实现（基于时间轮） |
 | `timingwheel.go` | 共享单级时间轮（128 slots，1s tick） |
 | `reconnect.go` | `Reconnector` 接口、`reconnector` 实现（指数退避） |
@@ -373,7 +537,11 @@ func main() {
 ## 注意事项
 
 1. **V2.0 心跳基于共享时间轮** — 不再是 per-conn ticker goroutine，10 万连接的心跳 goroutine 从 10 万降至 1 个
-2. **StateChan 容量 16** — 状态变化过快时会丢弃旧状态，业务监听应尽早读取
-3. **重连不自动恢复 Pipeline** — V2.1 会补充重连后重新组装 Pipeline 的逻辑
-4. **Session.Close() 同时关闭 Conn 和 stateChan** — 调用后连接不可再用，监听 StateChan 的 goroutine 会收到通道关闭信号
-5. **心跳与重连均为 per-Session** — 但心跳 goroutine 已共享（时间轮），重连 goroutine 按需创建
+2. **StateChan 是发布/订阅模式，不是单一共享 channel** — 每次调用创建独立订阅，多个 goroutine 可以各自监听而不互相影响
+3. **StateChan 容量 16** — 状态变化过快时会丢弃旧状态，业务监听应尽早读取
+4. **SetState 广播到所有订阅者** — 新状态会发送到每一个已注册的 StateChan 通道，满时丢弃
+5. **Close 关闭所有订阅通道** — 调用后先发送 StateClosed，再关闭所有通道，监听者可正常退出
+6. **重连不自动恢复 Pipeline** — V2.1 会补充重连后重新组装 Pipeline 的逻辑
+7. **Session.Close() 同时关闭 Conn 和所有 StateChan** — 调用后连接不可再用，监听 StateChan 的 goroutine 会收到通道关闭信号
+8. **心跳与重连均为 per-Session** — 但心跳 goroutine 已共享（时间轮），重连 goroutine 按需创建
+9. **epoll 模式下 onClose 回调触发 SetState(StateDisconnected)** — EpollConn.onClose 是 EventLoop 通知 Session 的桥梁

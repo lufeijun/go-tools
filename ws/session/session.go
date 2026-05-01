@@ -1,6 +1,7 @@
 package session
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,46 +55,72 @@ type Session interface {
 
 // defaultSession is the standard Session implementation.
 type defaultSession struct {
-	conn      conn.Conn
-	config    Config
-	stateChan chan State
-	state     State
-	closed    int32
+	conn   conn.Conn
+	config Config
+	state  State
+	closed int32
+
+	mu       sync.Mutex
+	subs     map[chan State]struct{}
 }
 
 // NewSession creates a new Session.
 func NewSession(c conn.Conn, cfg Config) Session {
 	return &defaultSession{
-		conn:      c,
-		config:    cfg,
-		stateChan: make(chan State, 16),
-		state:     StateDisconnected,
+		conn: c,
+		config: cfg,
+		subs: make(map[chan State]struct{}),
 	}
 }
 
-func (s *defaultSession) Conn() conn.Conn         { return s.conn }
-func (s *defaultSession) State() State            { return s.state }
-func (s *defaultSession) StateChan() <-chan State { return s.stateChan }
+func (s *defaultSession) Conn() conn.Conn { return s.conn }
+func (s *defaultSession) State() State    { return s.state }
+
+// StateChan returns a new channel that receives state changes.
+// Each call creates a fresh subscriber; messages are broadcast to all subscribers.
+func (s *defaultSession) StateChan() <-chan State {
+	ch := make(chan State, 16)
+	s.mu.Lock()
+	s.subs[ch] = struct{}{}
+	// Deliver current state to the new subscriber so it doesn't miss the latest.
+	if s.state != StateDisconnected {
+		select {
+		case ch <- s.state:
+		default:
+		}
+	}
+	s.mu.Unlock()
+	return ch
+}
 
 func (s *defaultSession) SetState(st State) {
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return
 	}
 	s.state = st
-	select {
-	case s.stateChan <- st:
-	default:
+	s.mu.Lock()
+	for ch := range s.subs {
+		select {
+		case ch <- st:
+		default:
+		}
 	}
+	s.mu.Unlock()
 }
 
 func (s *defaultSession) Close() error {
 	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
 		s.state = StateClosed
-		select {
-		case s.stateChan <- StateClosed:
-		default:
+		s.mu.Lock()
+		for ch := range s.subs {
+			select {
+			case ch <- StateClosed:
+			default:
+			}
+			close(ch)
 		}
-		close(s.stateChan)
+		s.subs = make(map[chan State]struct{})
+		s.mu.Unlock()
 	}
 	return s.conn.Close()
 }

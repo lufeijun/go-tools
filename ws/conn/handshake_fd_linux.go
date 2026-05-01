@@ -25,32 +25,37 @@ func ServerHandshakeFD(fd int) (int, error) {
 	}
 	defer unix.SetNonblock(fd, true) // Restore non-blocking when done
 
-	// Create a file from the fd
-	f := os.NewFile(uintptr(fd), "ws-conn")
+	// Dup the fd so net.FileConn gets its own copy that it can safely close.
+	// This prevents the GC finalizer on *os.File from closing our original fd.
+	dupFd, err := unix.Dup(fd)
+	if err != nil {
+		return fd, fmt.Errorf("dup: %w", err)
+	}
+
+	f := os.NewFile(uintptr(dupFd), "ws-conn")
 	if f == nil {
+		unix.Close(dupFd)
 		return fd, fmt.Errorf("os.NewFile failed")
 	}
-	// Note: We don't close f because that would close the fd
 
-	// Get a net.Conn (this dups the fd internally)
 	nc, err := net.FileConn(f)
+	// Close the *os.File immediately to release the dup'd fd from GC finalizer.
+	// net.FileConn has already done its own dup internally, so nc uses yet another fd.
+	f.Close()
 	if err != nil {
 		return fd, fmt.Errorf("net.FileConn: %w", err)
 	}
-	defer nc.Close() // Safe to close - it closes the dup'd fd
+	defer nc.Close() // Close the net.FileConn's internal dup
 
-	// Set deadline for handshake
 	nc.SetDeadline(time.Now().Add(defaultHandshakeTimeout))
 	defer nc.SetDeadline(time.Time{})
 
-	// Read HTTP request
 	br := bufio.NewReader(nc)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return fd, fmt.Errorf("read request: %w", err)
 	}
 
-	// Validate request
 	if req.Method != "GET" {
 		return fd, errInvalidHandshake
 	}
@@ -68,7 +73,6 @@ func ServerHandshakeFD(fd int) (int, error) {
 		return fd, errInvalidHandshake
 	}
 
-	// Compute accept key and write response
 	acceptKey := computeAcceptKey(secKey)
 	response := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
@@ -91,38 +95,39 @@ func ClientHandshakeFD(fd int, rawURL string, headers http.Header) error {
 	}
 	defer unix.SetNonblock(fd, true) // Restore non-blocking when done
 
-	// Create a file from the fd
-	f := os.NewFile(uintptr(fd), "ws-conn")
+	// Dup the fd so net.FileConn gets its own copy that it can safely close.
+	dupFd, err := unix.Dup(fd)
+	if err != nil {
+		return fmt.Errorf("dup: %w", err)
+	}
+
+	f := os.NewFile(uintptr(dupFd), "ws-conn")
 	if f == nil {
+		unix.Close(dupFd)
 		return fmt.Errorf("os.NewFile failed")
 	}
-	// Note: We don't close f because that would close the fd
 
-	// Get a net.Conn (this dups the fd internally)
 	nc, err := net.FileConn(f)
+	f.Close()
 	if err != nil {
 		return fmt.Errorf("net.FileConn: %w", err)
 	}
-	defer nc.Close() // Safe to close - it closes the dup'd fd
+	defer nc.Close()
 
-	// Set deadline for handshake
 	nc.SetDeadline(time.Now().Add(defaultHandshakeTimeout))
 	defer nc.SetDeadline(time.Time{})
 
-	// Parse URL
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return err
 	}
 
-	// Generate client key and compute accept key
 	secKey, err := generateClientSecKey()
 	if err != nil {
 		return err
 	}
 	acceptKey := computeAcceptKey(secKey)
 
-	// Build request
 	var b strings.Builder
 	b.WriteString("GET " + u.RequestURI() + " HTTP/1.1\r\n")
 	b.WriteString("Host: " + u.Host + "\r\n")
@@ -136,21 +141,17 @@ func ClientHandshakeFD(fd int, rawURL string, headers http.Header) error {
 		}
 	}
 	b.WriteString("\r\n")
-	req := b.String()
 
-	// Write request
-	if _, err := nc.Write([]byte(req)); err != nil {
+	if _, err := nc.Write([]byte(b.String())); err != nil {
 		return fmt.Errorf("write request: %w", err)
 	}
 
-	// Read response
 	resp, err := http.ReadResponse(bufio.NewReader(nc), nil)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Validate response
 	if resp.StatusCode != 101 {
 		return fmt.Errorf("server returned status %s", resp.Status)
 	}

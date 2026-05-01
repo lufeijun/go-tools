@@ -38,7 +38,7 @@ type Event struct {
 }
 
 const (
-	EventRead  uint32 = 1 << iota
+	EventRead uint32 = 1 << iota
 	EventWrite
 	EventError
 	EventHup

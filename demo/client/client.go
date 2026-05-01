@@ -51,7 +51,10 @@ func main() {
 		PongTimeout:  60 * time.Second,
 	}
 
-	c := client.NewClient(cfg)
+	c, err := client.NewClient(cfg)
+	if err != nil {
+		log.Fatal("创建客户端失败:", err)
+	}
 
 	// 在单独的 goroutine 中监听连接状态变化
 	go func() {

@@ -275,6 +275,127 @@
 
 ---
 
+## 六、双 I/O 模式开发踩坑记录
+
+> 以下为本次「netConn + epollConn 双模式切换」开发过程中遇到的所有 bug，按根因分类整理，供后续开发参考。
+
+### 6.1 `os.NewFile` GC Finalizer 关闭原始 fd
+
+- **现象**：epoll 模式下客户端连接后 ~4s 断开，服务端日志不断打印「连接断开，已清理映射」
+- **根因**：`conn/handshake_fd_linux.go` 中 `ServerHandshakeFD` 和 `ClientHandshakeFD` 使用 `os.NewFile(uintptr(fd), ...)` 创建 `*os.File`。Go runtime 为 `*os.File` 注册了 GC finalizer，函数返回后 `f` 被回收时 finalizer 调用 `close(fd)`，导致 EpollConn 持有的原始 fd 被关闭
+- **修复**：先用 `unix.Dup(fd)` 复制 fd，让 `os.NewFile` / `net.FileConn` 操作 dup 的 fd；`f.Close()` 释放 dup fd 的 GC finalizer，`net.FileConn` 内部再 dup 一次给自己用，`nc.Close()` 关闭 net.FileConn 内部的 dup。原始 fd 始终不受 GC 影响
+- **教训**：**永远不要把原始 fd 传给 `os.NewFile`**，除非你打算让 `*os.File` 拥有该 fd 的生命周期。需要通过 `net.FileConn` 做 HTTP 握手时，必须先 `Dup` 隔离
+
+### 6.2 `serveConn` epoll 模式下 channel 一次读取即退出
+
+- **现象**：epoll 连接建立后立即被 Close，日志显示连接存活时间极短
+- **根因**：`initSession` 中 `sess.SetState(session.StateConnected)` 往 `stateChan` 发送了 `StateConnected`；`serveConn` 的 epoll 分支 `<-sess.StateChan()` 读取到这个值后立即返回，defer 中 `sess.Close()` 关闭连接
+- **修复**：改为循环读取 `stateChan`，直到收到 `StateClosed` 或 `StateDisconnected` 才退出
+  ```go
+  // 修复前
+  <-sess.StateChan()
+
+  // 修复后
+  for st := range sess.StateChan() {
+      if st == session.StateClosed || st == session.StateDisconnected {
+          return
+      }
+  }
+  ```
+- **教训**：从 channel 读取状态时，必须明确"什么状态才是终止信号"，不能用单次读取。`stateChan` 是带缓冲的（cap=16），建立连接时可能已有多条状态消息入队
+
+### 6.3 Pipeline `prevOutbound` 链断裂导致写静默丢失
+
+- **现象**：epoll 模式下 EchoHandler 收到消息后调用 `ctx.Write()` 写回，但客户端收不到任何响应，无报错
+- **根因**：`pipeline.rebuild()` 只给 `OutboundHandler` 类型的 handler 设置了 `prevOutbound`。非 Outbound handler（如 EchoHandler）的 `prevOutbound` 始终为 nil，调用 `ctx.Write()` → `invokeChannelWrite()` → `c.prevOutbound.Load()` 返回 nil，写入被静默丢弃
+- **修复**：`rebuild()` 中从 head 往 tail 遍历，每个 handler（不论类型）都记录其朝 head 方向最近的 OutboundHandler
+  ```go
+  // 修复前：只给 OutboundHandler 本身设 prevOutbound
+  for ctx := p.tail.prev; ctx != p.head; ctx = ctx.prev {
+      if _, ok := ctx.handler.(OutboundHandler); ok { ... }
+  }
+
+  // 修复后：每个 handler 都指向其左侧最近的 OutboundHandler
+  var lastOutbound *handlerContext
+  for ctx := p.head.next; ctx != p.tail; ctx = ctx.next {
+      ctx.prevOutbound.Store(lastOutbound)
+      if _, ok := ctx.handler.(OutboundHandler); ok {
+          lastOutbound = ctx
+      }
+  }
+  p.tail.prevOutbound.Store(lastOutbound)
+  ```
+- **教训**：Pipeline 的 outbound 链路设计中，`prevOutbound` 不是"前一个 OutboundHandler"的链表指针，而是"任何 handler 调 Write 时应该委托给谁"的跳转表。每个 handler 都需要这个信息，否则非 Outbound handler 的 `ctx.Write()` 就是死路
+
+### 6.4 `NewServer` / `NewClient` 签名变更未更新所有调用方
+
+- **现象**：编译报错 `assignment mismatch: 1 variable but server.NewServer returns 2 values`
+- **根因**：`NewServer` 从 `Server` 改为 `(Server, error)` 返回值后，demo 代码中仍用 `srv := server.NewServer(cfg)` 单变量赋值
+- **修复**：全局搜索 `NewServer(` 和 `NewClient(` 调用点，全部改为双变量赋值并处理 error
+- **教训**：修改公开 API 签名后，必须同步 grep 所有调用方，包括 demo、test、example
+
+### 6.5 chat server `main()` 缺少阻塞等待导致进程立即退出
+
+- **现象**：chat server 启动后直接退出，不监听端口
+- **根因**：`Start()` 内部用 goroutine 启动监听，`main()` 执行完最后一行后进程退出，所有 goroutine 被杀
+- **修复**：添加 `signal.Notify(quit, SIGINT, SIGTERM)` + `<-quit` 阻塞等待
+- **教训**：Go 中 `main()` 退出 = 进程退出，所有 goroutine 立刻死亡。任何 server 的 `main()` 都必须有阻塞机制（signal wait、select{}、或 `srv.Start()` 本身阻塞）
+
+### 6.6 `Stop()` 未关闭已有连接导致 `wg.Wait()` 死锁
+
+- **现象**：epoll 模式下 `srv.Stop()` 永久阻塞，进程无法退出
+- **根因**：`Stop()` 流程为 `acceptor.Close()` → `wg.Wait()`。`acceptor.Close()` 关闭了 acceptor 和 EventLoopGroup，但**没有主动关闭已注册的 EpollConn**。epoll 模式下 `serveConn` goroutine 阻塞在 `for st := range sess.StateChan()` 等待 `StateClosed`/`StateDisconnected`，而 EpollConn 没有被 Close → `sess.Close()` 不会被触发 → `stateChan` 永远不会收到关闭信号 → `wg.Done()` 永远不执行 → `wg.Wait()` 死锁
+- **修复**：
+  1. 给 `Hub` 接口添加 `CloseAll()` 方法，遍历所有 shard 中的 session 调用 `sess.Close()`
+  2. `Stop()` 中在 `acceptor.Close()` 之后、`wg.Wait()` 之前调用 `s.hub.CloseAll()`
+  ```go
+  // 修复前
+  func (s *defaultServer) Stop() error {
+      if err := s.acceptor.Close(); err != nil {
+          return err
+      }
+      s.wg.Wait()  // 永久阻塞
+      return nil
+  }
+
+  // 修复后
+  func (s *defaultServer) Stop() error {
+      if err := s.acceptor.Close(); err != nil {
+          return err
+      }
+      s.hub.CloseAll()  // 主动关闭所有连接，触发 serveConn 退出
+      s.wg.Wait()
+      return nil
+  }
+  ```
+- **教训**：Server 的 graceful shutdown 必须保证完整关闭链路——不只是停止监听（acceptor），还要主动关闭所有已建立的连接（hub），否则持有这些连接的 goroutine 永远不会退出。`sync.WaitGroup` 只能追踪已知会退出的 goroutine，如果退出条件永远不满足，`Wait()` 就是死锁
+
+### 6.7 EpollConn 关闭不通知上层，客户端断连无感知
+
+- **现象**：epoll 模式下客户端主动断开连接后，chat server 的状态监控 goroutine 收不到 `StateDisconnected`/`StateClosed`，`um.Unbind()` 永远不执行
+- **根因**：两个问题叠加：
+  1. `EpollConn.closeLocked()` 只做底层清理（deregister fd、close fd），**没有任何机制通知上层**。不触发 `ChannelInactive`，不改 session 状态，上层完全无感知
+  2. `session.stateChan` 是单一 channel，`serveConn` 和用户监控 goroutine 都在 `range sess.StateChan()` 竞争消费，即使有状态消息也只能被其中一方读到，另一方永远阻塞
+- **修复**：
+  1. 给 `EpollConn` 添加 `onClose func()` 回调，`closeLocked()` 中触发；server 侧通过 `SetOnClose` 注册回调，将 session 状态设为 `StateDisconnected`
+  2. 将 `session.stateChan` 从单一 channel 改为发布/订阅模式：`StateChan()` 每次调用创建独立订阅者 channel，`SetState` / `Close` 向所有订阅者广播
+  ```go
+  // 修复前：单一 channel，竞争消费
+  type defaultSession struct {
+      stateChan chan State  // 只有一个，消费者互相抢
+  }
+
+  // 修复后：发布/订阅，每个订阅者独立 channel
+  type defaultSession struct {
+      subs map[chan State]struct{}  // 每个调用 StateChan() 的 goroutine 独立接收
+  }
+  ```
+- **教训**：
+  - 连接层的 Close 必须有向上通知的机制。底层关闭 fd 不等于上层知道连接已断开——中间隔了 EpollConn → Pipeline → Session → 业务层，每一层都需要被通知
+  - 状态变更 channel 如果有多个消费者，不能用单一 channel（消费者竞争），必须用 pub/sub 或 fan-out 模式
+
+---
+
 ## 验证方式
 
 1. **单元测试**：每个优化点配套测试

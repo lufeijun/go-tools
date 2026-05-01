@@ -20,12 +20,12 @@ func newMockHubConn(id uint64) *mockHubConn {
 	return &mockHubConn{id: id, pip: pipeline.NewPipeline()}
 }
 
-func (m *mockHubConn) ID() uint64                        { return m.id }
+func (m *mockHubConn) ID() uint64                         { return m.id }
 func (m *mockHubConn) Pipeline() pipeline.ChannelPipeline { return m.pip }
-func (m *mockHubConn) Read(b buf.ByteBuf) error          { return nil }
-func (m *mockHubConn) Write(b buf.ByteBuf) error         { return nil }
-func (m *mockHubConn) RemoteAddr() net.Addr              { return nil }
-func (m *mockHubConn) LocalAddr() net.Addr               { return nil }
+func (m *mockHubConn) Read(b buf.ByteBuf) error           { return nil }
+func (m *mockHubConn) Write(b buf.ByteBuf) error          { return nil }
+func (m *mockHubConn) RemoteAddr() net.Addr               { return nil }
+func (m *mockHubConn) LocalAddr() net.Addr                { return nil }
 func (m *mockHubConn) IsClient() bool                     { return false }
 func (m *mockHubConn) Close() error                       { return nil }
 func (m *mockHubConn) Active() bool                       { return true }

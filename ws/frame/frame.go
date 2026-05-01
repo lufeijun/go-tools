@@ -355,7 +355,7 @@ func readFrameBufWithAccumulated(r io.Reader, pool buf.Pool, maxPayload, accumul
 
 	if payloadLen > 0 {
 		bb.EnsureWritable(payloadLen)
-		data := bb.Bytes()[bb.WriterIndex():bb.WriterIndex()+payloadLen]
+		data := bb.Bytes()[bb.WriterIndex() : bb.WriterIndex()+payloadLen]
 		if _, err := io.ReadFull(r, data); err != nil {
 			bb.Release()
 			return Frame{}, nil, err

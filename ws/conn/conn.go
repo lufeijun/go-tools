@@ -14,7 +14,7 @@ var ErrConnClosed = errors.New("conn: connection closed")
 
 // Message is the high-level message structure.
 type Message struct {
-	Type   byte   // Opcode
+	Type   byte // Opcode
 	Data   []byte
 	Status uint16 // For Close frames
 }
@@ -39,6 +39,7 @@ type EventDrivenConn interface {
 	OnEvent(events uint32)
 	SetEventLoop(el interface{})
 	SetOnFrame(fn func(frame.Frame))
+	SetOnClose(fn func())
 }
 
 var connIDSeq uint64

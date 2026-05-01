@@ -274,17 +274,17 @@ func (w *writeBuf) WritableBytes() int     { return 1 << 30 }
 func (w *writeBuf) Write(p []byte) (int, error) {
 	return w.bb.Write(p)
 }
-func (w *writeBuf) WriteByte(b byte) error { return w.bb.WriteByte(b) }
-func (w *writeBuf) EnsureWritable(min int) {}
+func (w *writeBuf) WriteByte(b byte) error              { return w.bb.WriteByte(b) }
+func (w *writeBuf) EnsureWritable(min int)              {}
 func (w *writeBuf) Slice(start, length int) buf.ByteBuf { return nil }
-func (w *writeBuf) Retain() buf.ByteBuf                { return w }
-func (w *writeBuf) Release()                           {}
-func (w *writeBuf) RefCount() int                      { return 1 }
-func (w *writeBuf) Bytes() []byte                      { return w.bb.Bytes() }
-func (w *writeBuf) ReaderIndex() int                   { return 0 }
-func (w *writeBuf) WriterIndex() int                   { return w.bb.Len() }
-func (w *writeBuf) SetReaderIndex(v int)               {}
-func (w *writeBuf) SetWriterIndex(v int)               {}
+func (w *writeBuf) Retain() buf.ByteBuf                 { return w }
+func (w *writeBuf) Release()                            {}
+func (w *writeBuf) RefCount() int                       { return 1 }
+func (w *writeBuf) Bytes() []byte                       { return w.bb.Bytes() }
+func (w *writeBuf) ReaderIndex() int                    { return 0 }
+func (w *writeBuf) WriterIndex() int                    { return w.bb.Len() }
+func (w *writeBuf) SetReaderIndex(v int)                {}
+func (w *writeBuf) SetWriterIndex(v int)                {}
 
 func TestReadFrameFromBuf_TextUnmasked(t *testing.T) {
 	raw := []byte{0x81, 0x05, 'H', 'e', 'l', 'l', 'o'}

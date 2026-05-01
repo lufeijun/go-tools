@@ -82,8 +82,8 @@ type byteBuf struct {
 ### 读写指针模型
 
 ```
-[0  1  2  3  4  5  6  7  8  9]   ← 底层 data 数组（capacity = 10）
-        ↑              ↑
+[0  1  2  3  4  5  6  7  8  9]   <-- 底层 data 数组（capacity = 10）
+        ^              ^
    readerIndex     writerIndex
 
 ReadableBytes() = writerIndex - readerIndex = 5
@@ -102,10 +102,10 @@ WritableBytes() = capacity - writerIndex = 4
 1. 计算 `needed = writerIndex + min`
 2. 若 `needed <= cap(data)`，直接扩展切片长度，返回
 3. 否则按 **Pool 档位对齐** 分配新数组：
-   - `<= 512` → 512
-   - `<= 4096` → 4096
-   - `<= 65536` → 65536
-   - `> 65536` → 下一个 2 的幂
+   - `<= 512` -> 512
+   - `<= 4096` -> 4096
+   - `<= 65536` -> 65536
+   - `> 65536` -> 下一个 2 的幂
 4. 通过 `make` + `copy` 迁移数据
 
 **为什么对齐？**
@@ -167,12 +167,12 @@ func main() {
     bb.Write([]byte("hello world"))
     fmt.Printf("可读字节数: %d\n", bb.ReadableBytes()) // 11
 
-    // 3. Peek — 不移动读指针
+    // 3. Peek -- 不移动读指针
     peek := bb.Peek(5)
     fmt.Printf("Peek(5): %s\n", string(peek))        // hello
     fmt.Printf("Peek 后可读: %d\n", bb.ReadableBytes()) // 还是 11
 
-    // 4. ReadBytes — 移动读指针（会 alloc 新 slice）
+    // 4. ReadBytes -- 移动读指针（会 alloc 新 slice）
     data := bb.ReadBytes(5)
     fmt.Printf("ReadBytes(5): %s\n", string(data))    // hello
     fmt.Printf("读取后可读: %d\n", bb.ReadableBytes())  // 6
@@ -245,15 +245,64 @@ b.Release()       // 如果 b 来自 Pool，自动归还
 // and must also obey the single-writer rule.
 ```
 
+### epoll 模式下的跨 goroutine 所有权转移
+
+在 epoll 模式下，ByteBuf 可能跨越 goroutine 边界：
+
+1. **EventLoop goroutine** 读取数据，写入 ByteBuf
+2. **worker pool goroutine** 从 ByteBuf 解析帧
+3. 如果业务逻辑需要异步处理，ByteBuf 可能从 worker pool goroutine 传递到**业务 goroutine 池**
+
+**必须使用 Retain/Release 进行所有权转移：**
+
+```go
+// EventLoop goroutine 中
+bb := pool.Get(4096)
+bb.Write(data)
+bb.Retain()   // +1，因为要传给另一个 goroutine
+pool.submit(func() {
+    // worker goroutine 中
+    processBuffer(bb)
+    bb.Release()  // -1，worker 处理完毕
+})
+bb.Release()  // -1，EventLoop 不再持有
+```
+
+**关键原则：** 谁持有谁负责 Release。跨 goroutine 传递时，发送方 Retain，接收方 Release。不遵守会导致引用计数泄漏或 double-free panic。
+
 ---
 
 ## 与 frame 层的协作
 
 `frame.ReadFrameBuf` 和 `frame.WriteFrameTo` 直接操作 `ByteBuf` 的 `ReaderIndex`/`WriterIndex`，避免多次内存拷贝：
 
-- **读方向**：`eventloop` 读数据直接写入 `ByteBuf` → `ReadFrameFromBuf` 通过 `Peek+Skip` 零拷贝解析
+- **读方向**：`eventloop` 读数据直接写入 `ByteBuf` -> `ReadFrameFromBuf` 通过 `Peek+Skip` 零拷贝解析
 - **写方向**：`FrameCodec` 直接写入发送队列的 `ByteBuf`，合并 header + payload 后单次 `write()`
 - **广播**：同一份 `ByteBuf` 通过 `Retain()` 增加引用计数，发送到多个连接后各 `Release()`
+
+### ByteBuf 被 FrameCodec 和 ConnWriter 使用
+
+**出站路径：**
+
+```
+业务代码调用 ctx.Write(&conn.Message{...})
+    |
+    v
+Pipeline 出站链: Tail -> ... -> FrameCodec.Write -> ConnWriter.Write
+    |                    |                |
+    |                    v                v
+    |            WriteFrameTo(bb, frame)  bb.Write(data) -> unix.Write(fd, bb.Bytes())
+    |            将 Message 编码为 Frame  将 ByteBuf 写入底层连接
+    |
+    v
+FrameCodec.Write 通过 WriteFrameTo 将帧数据写入 ByteBuf
+ConnWriter.Write 通过 Conn.Write 将 ByteBuf 数据发送到网络
+```
+
+**ByteBuf 在这两层的使用方式：**
+
+1. **FrameCodec.Write（通过 WriteFrameTo）** — 将 `conn.Message` 编码为 `Frame`，通过 `frame.WriteFrameTo(bb, f)` 序列化到 ByteBuf
+2. **ConnWriter.Write（通过 Conn.Write）** — 将 ByteBuf 中的数据通过 `conn.Write(bb)` 发送到网络
 
 ---
 
@@ -290,3 +339,6 @@ BenchmarkByteBuf_PoolGetPut   // Pool.Get + Write 200B + Release
 3. **NewByteBuf 不归 Pool** — 只有通过 `Pool.Get()` 创建的才关联 Pool，`NewByteBuf` 创建的 `Release()` 后直接丢弃
 4. **Slice 会 Retain 原始 buf** — 释放顺序不影响安全，但建议先 `Release` 切片再 `Release` 原始 buf
 5. **EnsureWritable 按 Pool 档位对齐** — 扩容后的容量可能大于请求值，这是为了提高 Pool 命中率
+6. **ByteBuf 被 FrameCodec.Write（通过 WriteFrameTo）和 ConnWriter.Write（通过 Conn.Write）使用** — 出站路径上 ByteBuf 在 Pipeline 中传递
+7. **epoll 模式下 ByteBuf 可能跨越 goroutine 边界** — EventLoop goroutine 和 handler goroutine pool 之间传递时，必须使用 Retain/Release 进行所有权转移
+8. **ByteBuf 不是线程安全的** — 同一时间只能有一个 goroutine 读写；跨 goroutine 传递必须通过 Retain/Release 转移所有权

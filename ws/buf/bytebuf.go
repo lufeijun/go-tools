@@ -43,11 +43,11 @@ type ByteBuf interface {
 
 // byteBuf is the default ByteBuf implementation.
 type byteBuf struct {
-	data         []byte
-	readerIndex  int
-	writerIndex  int
-	refCount     int32
-	pool         Pool
+	data        []byte
+	readerIndex int
+	writerIndex int
+	refCount    int32
+	pool        Pool
 }
 
 // NewByteBuf creates a new ByteBuf with the given capacity.
@@ -146,10 +146,10 @@ func (b *byteBuf) Slice(start, length int) ByteBuf {
 		panic(fmt.Sprintf("slice out of range: start=%d length=%d writerIndex=%d", start, length, b.writerIndex))
 	}
 	s := &byteBuf{
-		data:         b.data,
-		readerIndex:  start,
-		writerIndex:  start + length,
-		refCount:     1,
+		data:        b.data,
+		readerIndex: start,
+		writerIndex: start + length,
+		refCount:    1,
 	}
 	b.Retain()
 	return s
@@ -176,9 +176,9 @@ func (b *byteBuf) Release() {
 	}
 }
 
-func (b *byteBuf) RefCount() int       { return int(atomic.LoadInt32(&b.refCount)) }
-func (b *byteBuf) Bytes() []byte       { return b.data }
-func (b *byteBuf) ReaderIndex() int    { return b.readerIndex }
-func (b *byteBuf) WriterIndex() int    { return b.writerIndex }
+func (b *byteBuf) RefCount() int        { return int(atomic.LoadInt32(&b.refCount)) }
+func (b *byteBuf) Bytes() []byte        { return b.data }
+func (b *byteBuf) ReaderIndex() int     { return b.readerIndex }
+func (b *byteBuf) WriterIndex() int     { return b.writerIndex }
 func (b *byteBuf) SetReaderIndex(v int) { b.readerIndex = v }
 func (b *byteBuf) SetWriterIndex(v int) { b.writerIndex = v }

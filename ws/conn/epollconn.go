@@ -34,6 +34,7 @@ type EpollConn struct {
 
 	frameParser *frame.IncrementalParser
 	onFrame     func(frame.Frame)
+	onClose     func()
 }
 
 func NewEpollConn(fd int, isClient bool, id uint64) *EpollConn {
@@ -61,6 +62,11 @@ func (c *EpollConn) LocalAddr() net.Addr                { return nil } // TODO: 
 // SetOnFrame sets the callback function that will be invoked when a complete frame is received.
 func (c *EpollConn) SetOnFrame(fn func(frame.Frame)) {
 	c.onFrame = fn
+}
+
+// SetOnClose sets the callback function that will be invoked when the connection is closed.
+func (c *EpollConn) SetOnClose(fn func()) {
+	c.onClose = fn
 }
 
 // SetMaxFrameSize sets the maximum allowed frame size and recreates the frame parser.
@@ -166,6 +172,9 @@ func (c *EpollConn) closeLocked() {
 		}
 		c.writeBuf = nil
 		unix.Close(c.fd)
+		if c.onClose != nil {
+			c.onClose()
+		}
 	})
 }
 

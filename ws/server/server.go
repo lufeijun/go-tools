@@ -82,8 +82,8 @@ type defaultServer struct {
 	wg        sync.WaitGroup
 }
 
-func (s *defaultServer) Config() ws.Config     { return s.config }
-func (s *defaultServer) Hub() hub.Hub          { return s.hub }
+func (s *defaultServer) Config() ws.Config                  { return s.config }
+func (s *defaultServer) Hub() hub.Hub                       { return s.hub }
 func (s *defaultServer) OnConnect(fn func(session.Session)) { s.onConnect = fn }
 
 func (s *defaultServer) Listener() net.Listener {
@@ -151,6 +151,9 @@ func (s *defaultServer) initSession(c conn.Conn, nc net.Conn) session.Session {
 
 func (s *defaultServer) setupEpollFrameCallback(c conn.Conn, sess session.Session) {
 	if edc, ok := c.(conn.EventDrivenConn); ok {
+		edc.SetOnClose(func() {
+			sess.SetState(session.StateDisconnected)
+		})
 		edc.SetOnFrame(func(f frame.Frame) {
 			switch f.Opcode {
 			case frame.OpcodeText, frame.OpcodeBinary:
@@ -176,14 +179,20 @@ func (s *defaultServer) setupEpollFrameCallback(c conn.Conn, sess session.Sessio
 
 func (s *defaultServer) serveConn(sess session.Session, nc net.Conn) {
 	defer func() {
+		sess.SetState(session.StateDisconnected)
+		sess.Conn().Pipeline().FireChannelInactive()
 		sess.Close()
 		s.hub.Unregister(sess.Conn().ID())
 		s.wg.Done()
 	}()
 
 	if nc == nil {
-		// epoll mode: frame reading driven by eventloop, this goroutine just waits
-		<-sess.StateChan()
+		// epoll mode: frame reading driven by eventloop, this goroutine waits for close
+		for st := range sess.StateChan() {
+			if st == session.StateClosed || st == session.StateDisconnected {
+				return
+			}
+		}
 		return
 	}
 
@@ -228,6 +237,8 @@ func (s *defaultServer) Stop() error {
 	if err := s.acceptor.Close(); err != nil {
 		return err
 	}
+	// Close all registered connections so serveConn goroutines can exit.
+	s.hub.CloseAll()
 	s.wg.Wait()
 	return nil
 }

@@ -9,16 +9,16 @@ import (
 // It handles fragmentation by accumulating non-FIN frames and emitting a single
 // complete frame when the FIN bit is set.
 type IncrementalParser struct {
-	maxPayload int           // Maximum allowed payload size per frame/message
-	buf        []byte        // Buffer for accumulating partial data
-	err        error         // Last error encountered
+	maxPayload int            // Maximum allowed payload size per frame/message
+	buf        []byte         // Buffer for accumulating partial data
+	err        error          // Last error encountered
 	fragState  *fragmentState // State for handling fragmented messages
 }
 
 // fragmentState tracks the state of a fragmented message.
 type fragmentState struct {
-	opcode  Opcode  // Opcode of the first frame (text/binary)
-	payload []byte  // Accumulated payload
+	opcode  Opcode // Opcode of the first frame (text/binary)
+	payload []byte // Accumulated payload
 }
 
 // NewIncrementalParser creates a new incremental parser with the specified

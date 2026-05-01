@@ -38,11 +38,14 @@ func main() {
 	}
 	userID := os.Args[1]
 
-	c := client.NewClient(ws.Config{
+	c, err := client.NewClient(ws.Config{
 		Addr:         "ws://localhost:8080/",
 		PingInterval: 30 * time.Second,
 		PongTimeout:  60 * time.Second,
 	})
+	if err != nil {
+		log.Fatal("创建客户端失败:", err)
+	}
 	if err := c.Connect(); err != nil {
 		log.Fatal("连接失败:", err)
 	}

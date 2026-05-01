@@ -19,9 +19,9 @@ func (m *mockHandler) OnEvent(fd int, events uint32) {
 	m.evts.Store(events)
 }
 
-func (m *mockHandler) wasCalled() bool     { return m.called.Load() }
-func (m *mockHandler) lastFd() int         { return int(m.fd.Load()) }
-func (m *mockHandler) lastEvents() uint32  { return m.evts.Load() }
+func (m *mockHandler) wasCalled() bool    { return m.called.Load() }
+func (m *mockHandler) lastFd() int        { return int(m.fd.Load()) }
+func (m *mockHandler) lastEvents() uint32 { return m.evts.Load() }
 
 func TestEventConstants(t *testing.T) {
 	if EventRead != 1 {

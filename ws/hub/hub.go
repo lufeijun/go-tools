@@ -18,6 +18,7 @@ type Hub interface {
 	Send(id uint64, msg conn.Message)
 	Count() int
 	Get(id uint64) session.Session
+	CloseAll()
 }
 
 const broadcastQueueSize = 256
@@ -70,7 +71,7 @@ type shard struct {
 	mu    sync.RWMutex
 	conns map[uint64]session.Session
 	// Pad to a full cache line to prevent false sharing between shards.
-	_     [cacheLineSize - int(unsafe.Sizeof(sync.RWMutex{})) - int(unsafe.Sizeof(map[uint64]session.Session{}))]byte
+	_ [cacheLineSize - int(unsafe.Sizeof(sync.RWMutex{})) - int(unsafe.Sizeof(map[uint64]session.Session{}))]byte
 }
 
 func (h *shardedHub) shardIndex(id uint64) int {
@@ -125,4 +126,19 @@ func (h *shardedHub) Send(id uint64, msg conn.Message) {
 		return
 	}
 	s.Conn().Pipeline().FireChannelWrite(&msg)
+}
+
+func (h *shardedHub) CloseAll() {
+	for _, sh := range h.shards {
+		sh.mu.RLock()
+		sessions := make([]session.Session, 0, len(sh.conns))
+		for _, sess := range sh.conns {
+			sessions = append(sessions, sess)
+		}
+		sh.mu.RUnlock()
+
+		for _, sess := range sessions {
+			sess.Close()
+		}
+	}
 }

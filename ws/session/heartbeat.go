@@ -32,9 +32,9 @@ type perConnHeartbeater struct {
 	pongTimeout  time.Duration
 	onTimeout    func()
 
-	tw        *TimingWheel
-	pingTask  int64
-	stopOnce  sync.Once
+	tw       *TimingWheel
+	pingTask int64
+	stopOnce sync.Once
 }
 
 // NewPerConnHeartbeater creates a per-connection heartbeater.

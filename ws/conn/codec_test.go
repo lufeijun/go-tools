@@ -15,13 +15,13 @@ type captureContext struct {
 }
 
 func (c *captureContext) Pipeline() pipeline.ChannelPipeline { return c.pipeline }
-func (c *captureContext) FireChannelRead(msg interface{})     {}
-func (c *captureContext) FireChannelWrite(msg interface{})    {}
-func (c *captureContext) FireChannelActive()                  {}
-func (c *captureContext) FireChannelInactive()                {}
-func (c *captureContext) FireExceptionCaught(err error)       {}
-func (c *captureContext) Write(msg interface{})               { c.written = msg }
-func (c *captureContext) Flush()                              {}
+func (c *captureContext) FireChannelRead(msg interface{})    {}
+func (c *captureContext) FireChannelWrite(msg interface{})   {}
+func (c *captureContext) FireChannelActive()                 {}
+func (c *captureContext) FireChannelInactive()               {}
+func (c *captureContext) FireExceptionCaught(err error)      {}
+func (c *captureContext) Write(msg interface{})              { c.written = msg }
+func (c *captureContext) Flush()                             {}
 
 func TestFrameCodec_EncodesTextMessage(t *testing.T) {
 	codec := &FrameCodec{IsClient: false}

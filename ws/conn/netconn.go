@@ -37,12 +37,12 @@ func NewNetConn(nc net.Conn, isClient bool, id uint64) *netConn {
 	return c
 }
 
-func (c *netConn) ID() uint64                    { return c.id }
+func (c *netConn) ID() uint64                         { return c.id }
 func (c *netConn) Pipeline() pipeline.ChannelPipeline { return c.pipeline }
-func (c *netConn) RemoteAddr() net.Addr          { return c.conn.RemoteAddr() }
-func (c *netConn) LocalAddr() net.Addr           { return c.conn.LocalAddr() }
-func (c *netConn) IsClient() bool                { return c.isClient }
-func (c *netConn) Active() bool                  { return atomic.LoadInt32(&c.active) == 1 }
+func (c *netConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
+func (c *netConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
+func (c *netConn) IsClient() bool                     { return c.isClient }
+func (c *netConn) Active() bool                       { return atomic.LoadInt32(&c.active) == 1 }
 
 func (c *netConn) Read(b buf.ByteBuf) error {
 	if !c.Active() {

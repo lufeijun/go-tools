@@ -36,21 +36,13 @@ func (p *defaultPipeline) rebuild() {
 	}
 
 	var lastOutbound *handlerContext
-	for ctx := p.tail.prev; ctx != p.head; ctx = ctx.prev {
+	for ctx := p.head.next; ctx != p.tail; ctx = ctx.next {
+		ctx.prevOutbound.Store(lastOutbound)
 		if _, ok := ctx.handler.(OutboundHandler); ok {
-			if lastOutbound != nil {
-				lastOutbound.prevOutbound.Store(ctx)
-			} else {
-				p.tail.prevOutbound.Store(ctx)
-			}
 			lastOutbound = ctx
 		}
 	}
-	if lastOutbound != nil {
-		lastOutbound.prevOutbound.Store(nil)
-	} else {
-		p.tail.prevOutbound.Store(nil)
-	}
+	p.tail.prevOutbound.Store(lastOutbound)
 }
 
 type defaultPipeline struct {

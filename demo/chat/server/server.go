@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lufeijun/goTools/ws"
@@ -109,8 +112,8 @@ func (h *AuthHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
 	log.Printf("用户 %s 登录成功，连接ID=%d", login.UserID, h.sess.Conn().ID())
 }
 
-func (h *AuthHandler) ChannelActive(ctx pipeline.Context)  { ctx.FireChannelActive() }
-func (h *AuthHandler) ChannelInactive(ctx pipeline.Context) { ctx.FireChannelInactive() }
+func (h *AuthHandler) ChannelActive(ctx pipeline.Context)              { ctx.FireChannelActive() }
+func (h *AuthHandler) ChannelInactive(ctx pipeline.Context)            { ctx.FireChannelInactive() }
 func (h *AuthHandler) ExceptionCaught(ctx pipeline.Context, err error) {}
 
 // ChatHandler 处理聊天消息。
@@ -152,8 +155,8 @@ func (h *ChatHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
 	ctx.FireChannelRead(msg)
 }
 
-func (h *ChatHandler) ChannelActive(ctx pipeline.Context)  { ctx.FireChannelActive() }
-func (h *ChatHandler) ChannelInactive(ctx pipeline.Context) { ctx.FireChannelInactive() }
+func (h *ChatHandler) ChannelActive(ctx pipeline.Context)              { ctx.FireChannelActive() }
+func (h *ChatHandler) ChannelInactive(ctx pipeline.Context)            { ctx.FireChannelInactive() }
 func (h *ChatHandler) ExceptionCaught(ctx pipeline.Context, err error) {}
 
 func main() {
@@ -162,8 +165,12 @@ func main() {
 		Addr:         ":8080",
 		PingInterval: 30 * time.Second,
 		PongTimeout:  60 * time.Second,
+		Mode:         ws.ModeEpoll,
 	}
-	srv := server.NewServer(cfg)
+	srv, err := server.NewServer(cfg)
+	if err != nil {
+		log.Fatal("创建服务端失败:", err)
+	}
 
 	srv.OnConnect(func(sess session.Session) {
 		sess.Conn().Pipeline().AddLast("auth", &AuthHandler{
@@ -184,7 +191,19 @@ func main() {
 	})
 
 	log.Println("聊天服务器启动，监听 :8080")
-	if err := srv.Start(); err != nil {
-		log.Fatal(err)
+	go func() {
+		if err := srv.Start(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("正在关闭服务端...")
+	if err := srv.Stop(); err != nil {
+		log.Println("关闭失败:", err)
 	}
+	log.Println("服务端已停止")
 }

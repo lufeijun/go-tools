@@ -124,4 +124,3 @@ func TestComputeAcceptKey(t *testing.T) {
 		t.Errorf("computeAcceptKey = %q, want %q", got, expected)
 	}
 }
-

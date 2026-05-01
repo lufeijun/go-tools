@@ -23,6 +23,7 @@
 ## 核心特性
 
 - **Pipeline + Handler 链** — Netty 风格的入站/出站处理器链，业务逻辑以插件方式组装
+- **双 I/O 模式** — 通过 `Config.Mode` 切换 `netConn`（goroutine-per-conn）和 `epollConn`（事件驱动 Reactor），业务代码无需修改
 - **跨平台事件驱动** — Linux(epoll)、macOS/FreeBSD(kqueue)、Windows(IOCP 预留)
 - **引用计数 ByteBuf** — 零拷贝、分级对象池、读写指针分离
 - **分片锁 Hub** — 32 个独立锁，广播性能随分片数线性扩展
@@ -46,7 +47,7 @@ Go 版本要求：`>= 1.25`
 
 ## 快速开始
 
-### 服务端（Echo）
+### 服务端 — net 模式（默认）
 
 ```go
 package main
@@ -54,6 +55,9 @@ package main
 import (
     "fmt"
     "log"
+    "os"
+    "os/signal"
+    "syscall"
     "time"
 
     "github.com/lufeijun/goTools/ws"
@@ -80,7 +84,10 @@ func (h *EchoHandler) ExceptionCaught(ctx pipeline.Context, err error) {}
 
 func main() {
     cfg := ws.Config{Addr: ":8080", PingInterval: 30 * time.Second, PongTimeout: 60 * time.Second}
-    srv := server.NewServer(cfg)
+    srv, err := server.NewServer(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
 
     srv.OnConnect(func(sess session.Session) {
         sess.Conn().Pipeline().AddLast("echo", &EchoHandler{})
@@ -90,6 +97,44 @@ func main() {
     if err := srv.Start(); err != nil {
         log.Fatal(err)
     }
+
+    // 优雅关闭
+    sig := make(chan os.Signal, 1)
+    signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+    <-sig
+    log.Println("正在关闭服务端 ...")
+    srv.Stop()
+}
+```
+
+### 服务端 — epoll 模式（仅 Linux）
+
+```go
+func main() {
+    cfg := ws.Config{
+        Addr:           ":8080",
+        Mode:           ws.ModeEpoll,
+        PingInterval:   30 * time.Second,
+        PongTimeout:    60 * time.Second,
+    }
+    srv, err := server.NewServer(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    srv.OnConnect(func(sess session.Session) {
+        sess.Conn().Pipeline().AddLast("echo", &EchoHandler{})
+    })
+
+    log.Println("服务端启动（epoll 模式），监听 :8080 ...")
+    if err := srv.Start(); err != nil {
+        log.Fatal(err)
+    }
+
+    sig := make(chan os.Signal, 1)
+    signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+    <-sig
+    srv.Stop()
 }
 ```
 
@@ -128,7 +173,10 @@ func main() {
         PingInterval: 30 * time.Second,
         PongTimeout:  60 * time.Second,
     }
-    c := client.NewClient(cfg)
+    c, err := client.NewClient(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
     if err := c.Connect(); err != nil {
         log.Fatal("连接失败:", err)
     }
@@ -140,6 +188,7 @@ func main() {
         &conn.Message{Type: 0x1, Data: []byte("hello")})
 
     time.Sleep(2 * time.Second)
+    c.Close()
 }
 ```
 
@@ -156,15 +205,38 @@ go run client.go
 
 ## 核心概念
 
+### 双 I/O 模式
+
+`ws` 支持两种 I/O 模式，通过 `ws.Config.Mode` 切换，**业务代码无需任何修改**：
+
+| 模式 | 常量 | 实现类 | 说明 |
+|---|---|---|---|
+| net 模式 | `ws.ModeNet`（默认，零值） | `netConn` | 每个连接一个 goroutine，所有平台可用 |
+| epoll 模式 | `ws.ModeEpoll` | `epollConn` | 事件驱动 Reactor 模型，仅 Linux 可用 |
+
+```go
+// net 模式（默认，无需显式设置）
+cfg := ws.Config{Addr: ":8080"}
+
+// epoll 模式
+cfg := ws.Config{Addr: ":8080", Mode: ws.ModeEpoll}
+```
+
+- `NewServer(cfg)` / `NewClient(cfg)` 内部自动调用 `cfg.ValidateMode()`，若 `ModeEpoll` 在非 Linux 平台使用会返回错误
+- epoll 模式下，连接由 `epollAcceptor` 接收，帧读取由 `EventLoop` 驱动，空闲连接不占用 goroutine
+- 两种模式共享相同的 Pipeline、Handler、Session、Hub 接口，切换模式只需改一行配置
+
 ### Pipeline + Handler
 
 每个连接有一个 `ChannelPipeline`，挂了一串 Handler。数据从网络进来走 **Inbound 链**（从头到尾），数据发出去走 **Outbound 链**（从尾到头）。
 
 ```
-Inbound:  Head → FrameCodec → BizHandler → Tail
-Outbound: Tail → FrameCodec → BizHandler → Head
+Inbound:  ConnWriter → FrameCodec → BizHandler → Tail
+Outbound: BizHandler.ctx.Write → FrameCodec.Write → ConnWriter.Write → Conn.Write
 ```
 
+- `ConnWriter` — Pipeline 的 Head，负责将 ByteBuf 写入底层 `Conn`。出站链的最后一环，将编码后的帧数据真正发到网络
+- `FrameCodec` — 编解码器，入站将 `frame.Frame` 解码为 `*conn.Message`，出站将 `*conn.Message` 编码为 `ByteBuf` 并通过 `ctx.Write(bb)` 传递给下一个 OutboundHandler
 - `InboundHandler` 处理读进来的数据：`ChannelRead`、`ChannelActive`、`ChannelInactive`
 - `OutboundHandler` 处理发出去的数据：`Write`、`Flush`
 - `ctx.FireChannelRead(msg)` 传给下一个 InboundHandler
@@ -193,9 +265,23 @@ bb.Release()
 会话层管理连接的生命周期：
 
 - `State()` — 当前状态：`Disconnected` / `Connecting` / `Connected` / `Reconnecting` / `Closed`
-- `StateChan()` — 状态变化通知通道
+- `StateChan()` — 状态变化通知（发布/订阅模式）
 - `Conn()` — 获取底层连接和 Pipeline
 - `Close()` — 关闭会话
+
+**StateChan 发布/订阅模型：**
+
+每次调用 `sess.StateChan()` 会创建一个**全新的独立订阅者 channel**。多个 goroutine 可以各自独立订阅，互不干扰。新订阅者会立即收到当前状态。
+
+```go
+// goroutine A 独立订阅
+chA := sess.StateChan()
+
+// goroutine B 独立订阅，互不影响
+chB := sess.StateChan()
+
+// 两个 channel 各自收到状态变更通知
+```
 
 ### Hub
 
@@ -216,13 +302,47 @@ count := h.Count()
 ### 示例 1：聊天室（Hub 广播）
 
 ```go
-srv.OnConnect(func(sess session.Session) {
-    srv.Hub().Register(sess)
+type ChatHandler struct {
+    hub  hub.Hub
+    sess session.Session
+}
 
-    sess.Conn().Pipeline().AddLast("chat", &pipeline.testHandler{
-        // 收到消息后广播给所有人
+func (h *ChatHandler) Name() string { return "chat" }
+
+func (h *ChatHandler) ChannelRead(ctx pipeline.Context, msg interface{}) {
+    if m, ok := msg.(*conn.Message); ok && m.Type == 0x1 {
+        h.hub.Broadcast(conn.Message{Type: 0x1, Data: m.Data})
+    }
+    ctx.FireChannelRead(msg)
+}
+func (h *ChatHandler) ChannelActive(ctx pipeline.Context)   { ctx.FireChannelActive() }
+func (h *ChatHandler) ChannelInactive(ctx pipeline.Context) { ctx.FireChannelInactive() }
+func (h *ChatHandler) ExceptionCaught(ctx pipeline.Context, err error) {}
+
+func main() {
+    cfg := ws.Config{Addr: ":8080"}
+    srv, err := server.NewServer(cfg)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    srv.OnConnect(func(sess session.Session) {
+        srv.Hub().Register(sess)
+        sess.Conn().Pipeline().AddLast("chat", &ChatHandler{
+            hub:  srv.Hub(),
+            sess: sess,
+        })
     })
-})
+
+    if err := srv.Start(); err != nil {
+        log.Fatal(err)
+    }
+
+    sig := make(chan os.Signal, 1)
+    signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+    <-sig
+    srv.Stop()
+}
 ```
 
 ### 示例 2：绑定业务 userID 到 Session
@@ -252,13 +372,17 @@ func (um *UserManager) SendTo(userID string, msg conn.Message) {
 ### 示例 3：客户端状态监听 + 自动重连
 
 ```go
-c := client.NewClient(ws.Config{
+c, err := client.NewClient(ws.Config{
     Addr:              "ws://localhost:8080/",
     ReconnectInterval: 3 * time.Second,
     MaxReconnect:      5,
 })
+if err != nil {
+    log.Fatal(err)
+}
 c.Connect()
 
+// 每次调用 StateChan() 创建独立的订阅者 channel
 go func() {
     for st := range c.Session().StateChan() {
         switch st {
@@ -283,6 +407,7 @@ go func() {
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `Addr` | `string` | `""` | Server 监听地址 / Client 目标地址 |
+| `Mode` | `ws.IOMode` | `ModeNet` (0) | I/O 模式：ModeNet（goroutine-per-conn）或 ModeEpoll（事件驱动，仅 Linux） |
 | `ReadBufferSize` | `int` | `4096` | 读缓冲区大小 |
 | `WriteBufferSize` | `int` | `4096` | 写缓冲区大小 |
 | `MaxConnections` | `int` | `0` | 最大连接数，`0` 不限制 |
@@ -308,7 +433,10 @@ go func() {
 cfg := ws.DefaultConfig()
 cfg.Addr = ":8080"
 cfg.MaxFrameSize = 16 * 1024 * 1024 // 16MB
-srv := server.NewServer(cfg)
+srv, err := server.NewServer(cfg)
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 ---
@@ -326,7 +454,12 @@ srv := server.NewServer(cfg)
 │         ChannelPipeline · InboundHandler · OutboundHandler   │
 ├─────────────────────────────────────────────────────────────┤
 │                      连接层 (conn)                            │
-│         Conn · netConn · epollConn · Handshake · FrameCodec  │
+│    Conn · netConn · epollConn · ConnWriter · FrameCodec      │
+│                     · Handshake                              │
+├─────────────────────────────────────────────────────────────┤
+│                   接入层 (server Acceptor)                    │
+│     Acceptor · netAcceptor (HTTP Upgrade)                    │
+│              · epollAcceptor (Main Reactor)                  │
 ├─────────────────────────────────────────────────────────────┤
 │                      事件驱动 (eventloop)                     │
 │         EventLoop · Poller · epoll · kqueue · worker pool    │
@@ -336,24 +469,35 @@ srv := server.NewServer(cfg)
 └─────────────────────────────────────────────────────────────┘
 ```
 
+**双路径说明：**
+
+- **net 路径**：`netAcceptor`（HTTP Upgrade + Hijack）→ `netConn` → goroutine-per-conn 读取帧
+- **epoll 路径**：`epollAcceptor`（Main Reactor 接收连接）→ `epollConn` → `EventLoop` 驱动帧读取
+
+两条路径共享 Pipeline、Session、Hub，业务代码完全一致。
+
 **分层依赖规则：** 上层只依赖下层接口，不能跨层调用，不能反向依赖。
 
 | 包 | 职责 |
 |---|---|
-| `ws` | 根包：WSError、Config、DefaultConfig |
+| `ws` | 根包：WSError、Config、DefaultConfig、IOMode |
 | `ws/buf` | ByteBuf 接口 + 引用计数实现 + 分级对象池 |
 | `ws/frame` | RFC 6455 帧解析/序列化 |
 | `ws/pipeline` | ChannelPipeline + Handler 链 |
 | `ws/eventloop` | 跨平台事件驱动 + goroutine pool 调度 |
-| `ws/conn` | Conn 接口、netConn、epollConn、握手、编解码器 |
+| `ws/conn` | Conn 接口、netConn、epollConn、ConnWriter、FrameCodec、握手 |
 | `ws/session` | Session 接口、状态机、时间轮心跳、自动重连 |
 | `ws/hub` | 分片锁 Hub：注册/注销/广播/定向发送 |
-| `ws/server` | Server 启动、HTTP Upgrade、Session 生命周期 |
+| `ws/server` | Server 启动、Acceptor 接入（net/epoll）、Session 生命周期 |
 | `ws/client` | Client 连接、握手、重连、Session 生命周期 |
 
 ---
 
 ## 常见问题
+
+**Q: 如何启用 epoll 模式？**
+
+设置 `ws.Config{Mode: ws.ModeEpoll}` 即可。仅 Linux 可用，在其他平台 `NewServer` / `NewClient` 会返回错误。
 
 **Q: 客户端连不上服务端？**
 1. 确认服务端已启动
@@ -370,7 +514,7 @@ srv := server.NewServer(cfg)
 | 对比项 | v1 | v2 |
 |---|---|---|
 | API 风格 | Channel（`ReadChan()` / `WriteChan()`） | Pipeline Handler |
-| 并发模型 | goroutine-per-conn | 事件驱动（epoll/kqueue）|
+| 并发模型 | goroutine-per-conn | 双模式：netConn（goroutine-per-conn）+ epollConn（事件驱动）|
 | 缓冲区 | `sync.Pool` 两级复用 `[]byte` | 引用计数 ByteBuf |
 | 心跳 | per-conn ticker goroutine | 共享时间轮（单 goroutine）|
 | Hub | 单 goroutine + channel | 分片锁（32 个 RWMutex）|
@@ -383,10 +527,11 @@ v2 **不保证向后兼容**。
 
 1. **v2 不兼容 v1** — API 从 Channel 式改为 Pipeline Handler 式
 2. **Pipeline 在连接建立后注册** — 通过 `srv.OnConnect` 或 `c.OnConnect` 回调添加 Handler
-3. **epollConn 在 V2.1 完善** — 当前生产环境使用 `netConn`，事件驱动 Conn 的非阻塞读写完整实现将在 V2.1 交付
-4. **ByteBuf 不是线程安全的** — 跨 goroutine 传递需 `Retain/Release` 管理所有权
-5. **Hub 广播非阻塞** — 对慢连接直接跳过，避免广播被单个慢连接拖住
-6. **MaxFrameSize 防 DoS** — 默认 64MB，建议根据业务调整
+3. **NewServer/NewClient 返回错误** — `srv, err := server.NewServer(cfg)` / `c, err := client.NewClient(cfg)`，必须处理返回的 error
+4. **ModeEpoll 仅支持 Linux** — 在其他平台 NewServer/NewClient 会返回错误
+5. **ByteBuf 不是线程安全的** — 跨 goroutine 传递需 `Retain/Release` 管理所有权
+6. **Hub 广播非阻塞** — 对慢连接直接跳过，避免广播被单个慢连接拖住
+7. **MaxFrameSize 防 DoS** — 默认 64MB，建议根据业务调整
 
 ---
 

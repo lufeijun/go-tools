@@ -9,11 +9,11 @@ import (
 
 	"github.com/lufeijun/goTools/ws"
 	"github.com/lufeijun/goTools/ws/conn"
+	"github.com/lufeijun/goTools/ws/eventloop"
 	"github.com/lufeijun/goTools/ws/frame"
 	"github.com/lufeijun/goTools/ws/session"
 )
 
-// Client is the WebSocket client.
 type Client interface {
 	Config() ws.Config
 	Connect() error
@@ -22,48 +22,53 @@ type Client interface {
 	OnConnect(fn func(session.Session))
 }
 
-// NewClient creates a Client with the given config.
-func NewClient(cfg ws.Config) Client {
-	if cfg.ReadBufferSize == 0 {
-		defaults := ws.DefaultConfig()
-		if cfg.ReadBufferSize == 0 {
-			cfg.ReadBufferSize = defaults.ReadBufferSize
-		}
-		if cfg.WriteBufferSize == 0 {
-			cfg.WriteBufferSize = defaults.WriteBufferSize
-		}
-		if cfg.PingInterval == 0 {
-			cfg.PingInterval = defaults.PingInterval
-		}
-		if cfg.PongTimeout == 0 {
-			cfg.PongTimeout = defaults.PongTimeout
-		}
-		if cfg.MaxFrameSize == 0 {
-			cfg.MaxFrameSize = defaults.MaxFrameSize
-		}
-		if cfg.EventLoopWorkers == 0 {
-			cfg.EventLoopWorkers = defaults.EventLoopWorkers
-		}
-		if cfg.EventLoopStrategy == "" {
-			cfg.EventLoopStrategy = defaults.EventLoopStrategy
-		}
-		if cfg.BufferPoolSmall == 0 {
-			cfg.BufferPoolSmall = defaults.BufferPoolSmall
-		}
-		if cfg.BufferPoolDefault == 0 {
-			cfg.BufferPoolDefault = defaults.BufferPoolDefault
-		}
-		if cfg.BufferPoolLarge == 0 {
-			cfg.BufferPoolLarge = defaults.BufferPoolLarge
-		}
-		if cfg.ReconnectInterval == 0 {
-			cfg.ReconnectInterval = defaults.ReconnectInterval
-		}
-		if cfg.MaxReconnect == 0 {
-			cfg.MaxReconnect = defaults.MaxReconnect
-		}
+func NewClient(cfg ws.Config) (Client, error) {
+	if err := cfg.ValidateMode(); err != nil {
+		return nil, err
 	}
-	return &defaultClient{config: cfg}
+	defaults := ws.DefaultConfig()
+	if cfg.ReadBufferSize == 0 {
+		cfg.ReadBufferSize = defaults.ReadBufferSize
+	}
+	if cfg.WriteBufferSize == 0 {
+		cfg.WriteBufferSize = defaults.WriteBufferSize
+	}
+	if cfg.PingInterval == 0 {
+		cfg.PingInterval = defaults.PingInterval
+	}
+	if cfg.PongTimeout == 0 {
+		cfg.PongTimeout = defaults.PongTimeout
+	}
+	if cfg.MaxFrameSize == 0 {
+		cfg.MaxFrameSize = defaults.MaxFrameSize
+	}
+	if cfg.EventLoopWorkers == 0 {
+		cfg.EventLoopWorkers = defaults.EventLoopWorkers
+	}
+	if cfg.EventLoopStrategy == "" {
+		cfg.EventLoopStrategy = defaults.EventLoopStrategy
+	}
+	if cfg.BufferPoolSmall == 0 {
+		cfg.BufferPoolSmall = defaults.BufferPoolSmall
+	}
+	if cfg.BufferPoolDefault == 0 {
+		cfg.BufferPoolDefault = defaults.BufferPoolDefault
+	}
+	if cfg.BufferPoolLarge == 0 {
+		cfg.BufferPoolLarge = defaults.BufferPoolLarge
+	}
+	if cfg.ReconnectInterval == 0 {
+		cfg.ReconnectInterval = defaults.ReconnectInterval
+	}
+	if cfg.MaxReconnect == 0 {
+		cfg.MaxReconnect = defaults.MaxReconnect
+	}
+
+	c := &defaultClient{config: cfg}
+	if cfg.Mode == ws.ModeEpoll {
+		c.elg = newEventLoopGroupForClient(cfg)
+	}
+	return c, nil
 }
 
 type defaultClient struct {
@@ -72,9 +77,10 @@ type defaultClient struct {
 	onConnect func(session.Session)
 	mu        sync.Mutex
 	closed    bool
+	elg       eventloop.EventLoopGroup
 }
 
-func (c *defaultClient) Config() ws.Config      { return c.config }
+func (c *defaultClient) Config() ws.Config        { return c.config }
 func (c *defaultClient) Session() session.Session { return c.sess }
 func (c *defaultClient) OnConnect(fn func(session.Session)) {
 	c.onConnect = fn
@@ -84,10 +90,26 @@ func (c *defaultClient) Connect() error {
 	c.mu.Lock()
 	c.closed = false
 	c.mu.Unlock()
+
+	if c.elg != nil {
+		if err := c.elg.Start(); err != nil {
+			return err
+		}
+	}
+
 	return c.doConnect()
 }
 
 func (c *defaultClient) doConnect() error {
+	switch c.config.Mode {
+	case ws.ModeEpoll:
+		return c.doConnectEpoll()
+	default:
+		return c.doConnectNet()
+	}
+}
+
+func (c *defaultClient) doConnectNet() error {
 	nc, err := conn.ClientHandshake(c.config.Addr, c.config.Headers)
 	if err != nil {
 		return err
@@ -98,7 +120,19 @@ func (c *defaultClient) doConnect() error {
 	}
 
 	wc := conn.NewNetConn(nc, true, 1)
-	sess := session.NewSession(wc, session.Config{
+	sess := c.initSession(wc)
+
+	go c.serveConnNet(nc, sess)
+
+	c.sess = sess
+	if c.onConnect != nil {
+		c.onConnect(sess)
+	}
+	return nil
+}
+
+func (c *defaultClient) initSession(cn conn.Conn) session.Session {
+	sess := session.NewSession(cn, session.Config{
 		PingInterval:      c.config.PingInterval,
 		PongTimeout:       c.config.PongTimeout,
 		ReconnectInterval: c.config.ReconnectInterval,
@@ -108,30 +142,45 @@ func (c *defaultClient) doConnect() error {
 	hb := session.NewPerConnHeartbeater(c.config.PingInterval, c.config.PongTimeout)
 	hb.SetOnTimeout(func() {
 		sess.SetState(session.StateDisconnected)
-		wc.Close()
+		cn.Close()
 	})
 	sess.SetState(session.StateConnected)
 	hb.Start(sess)
 
-	// Add frame codec so handlers can write *Message back as WebSocket frames.
-	wc.Pipeline().AddFirst("headWriter", &conn.ConnWriter{Conn: wc})
-		wc.Pipeline().AddLast("codec", &conn.FrameCodec{IsClient: true})
+	cn.Pipeline().AddFirst("headWriter", &conn.ConnWriter{Conn: cn})
+	cn.Pipeline().AddLast("codec", &conn.FrameCodec{IsClient: true})
 
-	go c.serveConn(nc)
-
-	c.sess = sess
-
-	if c.onConnect != nil {
-		c.onConnect(sess)
+	if edc, ok := cn.(conn.EventDrivenConn); ok {
+		c.setupEpollFrameCallback(edc, sess)
 	}
-	return nil
+
+	return sess
 }
 
-func (c *defaultClient) serveConn(nc net.Conn) {
-	sess := c.sess
-	if sess == nil {
-		return
-	}
+func (c *defaultClient) setupEpollFrameCallback(edc conn.EventDrivenConn, sess session.Session) {
+	edc.SetOnFrame(func(f frame.Frame) {
+		switch f.Opcode {
+		case frame.OpcodeText, frame.OpcodeBinary:
+			msg := &conn.Message{Type: byte(f.Opcode), Data: f.Payload}
+			sess.Conn().Pipeline().FireChannelRead(msg)
+		case frame.OpcodePing:
+			pongMsg := &conn.Message{Type: byte(frame.OpcodePong), Data: f.Payload}
+			sess.Conn().Pipeline().FireChannelWrite(pongMsg)
+		case frame.OpcodeClose:
+			code := uint16(1000)
+			reason := ""
+			if len(f.Payload) >= 2 {
+				code = binary.BigEndian.Uint16(f.Payload[:2])
+				reason = string(f.Payload[2:])
+			}
+			closeMsg := &conn.Message{Type: byte(frame.OpcodeClose), Status: code, Data: []byte(reason)}
+			sess.Conn().Pipeline().FireChannelWrite(closeMsg)
+			sess.Conn().Close()
+		}
+	})
+}
+
+func (c *defaultClient) serveConnNet(nc net.Conn, sess session.Session) {
 	defer func() {
 		sess.Close()
 		c.maybeReconnect()
@@ -172,6 +221,18 @@ func (c *defaultClient) serveConn(nc net.Conn) {
 	}
 }
 
+func (c *defaultClient) serveConnEpoll(sess session.Session) {
+	defer func() {
+		sess.Close()
+		c.maybeReconnect()
+	}()
+	for st := range sess.StateChan() {
+		if st == session.StateClosed || st == session.StateDisconnected {
+			return
+		}
+	}
+}
+
 func (c *defaultClient) maybeReconnect() {
 	c.mu.Lock()
 	if c.closed {
@@ -200,7 +261,6 @@ func (c *defaultClient) maybeReconnect() {
 				backoff *= 2
 			}
 		}
-		// Reconnect exhausted.
 		if c.sess != nil {
 			c.sess.SetState(session.StateClosed)
 		}
@@ -211,6 +271,9 @@ func (c *defaultClient) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
+	if c.elg != nil {
+		c.elg.Stop()
+	}
 	if c.sess != nil {
 		return c.sess.Close()
 	}
