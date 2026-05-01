@@ -71,6 +71,25 @@ type Config struct {
 	Headers           http.Header
 	ReconnectInterval time.Duration
 	MaxReconnect      int
+	Mode              IOMode
+}
+
+// IOMode determines the connection I/O model.
+type IOMode int
+
+const (
+	// ModeNet uses net.Conn with goroutine-per-conn (default).
+	ModeNet IOMode = iota
+	// ModeEpoll uses epollConn with event-driven Reactor model (Linux only).
+	ModeEpoll
+)
+
+// ValidateMode checks that the configured IOMode is supported on this platform.
+func (c Config) ValidateMode() error {
+	if c.Mode == ModeEpoll && runtime.GOOS != "linux" {
+		return fmt.Errorf("epoll mode is only supported on Linux, current OS: %s", runtime.GOOS)
+	}
+	return nil
 }
 
 // DefaultConfig returns a Config with sensible defaults.
