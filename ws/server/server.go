@@ -110,7 +110,8 @@ func (s *defaultServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 	s.hub.Register(sess)
 
 	// Add frame codec so handlers can write *Message back as WebSocket frames.
-	sess.Conn().Pipeline().AddLast("codec", &conn.FrameCodec{Writer: nc, IsClient: false})
+	sess.Conn().Pipeline().AddFirst("headWriter", &conn.ConnWriter{Conn: c})
+		sess.Conn().Pipeline().AddLast("codec", &conn.FrameCodec{IsClient: false})
 
 	if s.onConnect != nil {
 		s.onConnect(sess)

@@ -114,7 +114,8 @@ func (c *defaultClient) doConnect() error {
 	hb.Start(sess)
 
 	// Add frame codec so handlers can write *Message back as WebSocket frames.
-	wc.Pipeline().AddLast("codec", &conn.FrameCodec{Writer: nc, IsClient: true})
+	wc.Pipeline().AddFirst("headWriter", &conn.ConnWriter{Conn: wc})
+		wc.Pipeline().AddLast("codec", &conn.FrameCodec{IsClient: true})
 
 	go c.serveConn(nc)
 
