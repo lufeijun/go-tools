@@ -92,6 +92,9 @@ type defaultEventLoop struct {
 	running     int32
 	stopCh      chan struct{}
 	pool        *workerPool
+	wakeFd      int // eventfd (Linux) or pipe read end (BSD); -1 if unavailable
+	wakeWriteFd int // write end for pipe-based wake; equals wakeFd for eventfd
+	openErr     error // set if poller.Open() failed
 }
 
 // NewEventLoop creates a new EventLoop backed by the given Poller.
@@ -104,12 +107,26 @@ func NewEventLoop(p Poller) EventLoop {
 // A workers value <= 0 defaults to GOMAXPROCS.
 func NewEventLoopWithPool(p Poller, workers int) EventLoop {
 	el := &defaultEventLoop{
-		poller: p,
-		stopCh: make(chan struct{}),
-		pool:   newWorkerPool(workers),
+		poller:  p,
+		stopCh:  make(chan struct{}),
+		pool:    newWorkerPool(workers),
+		wakeFd:  -1,
 	}
 	el.handlersVal.Store(make(map[int]EventHandler))
-	el.poller.Open()
+	if err := el.poller.Open(); err != nil {
+		el.openErr = err
+		return el
+	}
+	// Create and register platform-specific wake fd.
+	wfd, wwriteFd, err := createWakeFd()
+	if err != nil {
+		el.openErr = err
+		return el
+	}
+	el.wakeFd = wfd
+	el.wakeWriteFd = wwriteFd
+	// Register wake fd for read events so Wake() unblocks poller.Wait.
+	_ = el.poller.Add(wfd, EventRead)
 	return el
 }
 
@@ -155,13 +172,16 @@ func (el *defaultEventLoop) Mod(fd int, events uint32) error {
 	return el.poller.Mod(fd, events)
 }
 
-// Wake interrupts the poller wait (not yet implemented).
+// Wake interrupts the poller wait by writing to the wake fd.
 func (el *defaultEventLoop) Wake() {
-	// TODO: implement wake
+	doWake(el.wakeWriteFd)
 }
 
 // Run starts the event loop. It is start-once.
 func (el *defaultEventLoop) Run() error {
+	if el.openErr != nil {
+		return el.openErr
+	}
 	if !atomic.CompareAndSwapInt32(&el.running, 0, 1) {
 		return errors.New("already running")
 	}
@@ -180,6 +200,10 @@ func (el *defaultEventLoop) Run() error {
 		}
 
 		for _, e := range events {
+			if e.FD == el.wakeFd {
+				drainWake(el.wakeFd)
+				continue
+			}
 			h, ok := el.loadHandlers()[e.FD]
 			if ok {
 				el.pool.submit(func() {
@@ -210,5 +234,6 @@ func (el *defaultEventLoop) Stop() error {
 		_ = el.poller.Del(fd)
 	}
 	_ = el.poller.Close()
+	closeWakeFd(el.wakeFd, el.wakeWriteFd)
 	return nil
 }

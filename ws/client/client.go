@@ -119,7 +119,7 @@ func (c *defaultClient) doConnectNet() error {
 		return err
 	}
 
-	wc := conn.NewNetConn(nc, true, 1)
+	wc := conn.NewNetConn(nc, true, conn.NextConnID())
 	sess := c.initSession(wc)
 
 	go c.serveConnNet(nc, sess)
@@ -144,6 +144,8 @@ func (c *defaultClient) initSession(cn conn.Conn) session.Session {
 		sess.SetState(session.StateDisconnected)
 		cn.Close()
 	})
+	sess.SetHeartbeater(hb)
+	sess.SetState(session.StateConnecting)
 	sess.SetState(session.StateConnected)
 	hb.Start(sess)
 

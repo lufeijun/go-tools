@@ -195,6 +195,9 @@ func readFrameWithAccumulated(r io.Reader, maxPayload, accumulatedLen int) (Fram
 			if err != nil {
 				return Frame{}, err
 			}
+			if next.Opcode != 0x0 {
+				return Frame{}, &ProtocolError{Code: 1002, Message: "expected continuation frame"}
+			}
 			accumulated = append(accumulated, next.Payload...)
 			totalLen += len(next.Payload)
 			if maxPayload > 0 && totalLen > maxPayload {
@@ -368,10 +371,7 @@ func readFrameBufWithAccumulated(r io.Reader, pool buf.Pool, maxPayload, accumul
 	}
 
 	// Payload is the trailing bytes after the header.
-	result.Payload = bb.Peek(headerSize)
-	if len(result.Payload) > payloadLen {
-		result.Payload = result.Payload[:payloadLen]
-	}
+	result.Payload = bb.Bytes()[headerSize : headerSize+payloadLen]
 
 	if !result.FIN {
 		// Fragmented frame: read continuation frames and accumulate into
@@ -388,6 +388,11 @@ func readFrameBufWithAccumulated(r io.Reader, pool buf.Pool, maxPayload, accumul
 			if err != nil {
 				bb.Release()
 				return Frame{}, nil, err
+			}
+			if next.Opcode != 0x0 {
+				nextBB.Release()
+				bb.Release()
+				return Frame{}, nil, &ProtocolError{Code: 1002, Message: "expected continuation frame"}
 			}
 			// Append next payload to bb.
 			bb.Write(next.Payload)
@@ -418,6 +423,9 @@ func readFrameBufWithAccumulated(r io.Reader, pool buf.Pool, maxPayload, accumul
 //
 // If bb does not contain a complete frame, io.ErrShortBuffer is returned and
 // bb's reader index is left unchanged (the function rewinds on failure).
+//
+// NOTE: This function does not handle fragmented messages.  For fragmentation
+// support, use ReadFrame (blocking I/O) or IncrementalParser (non-blocking).
 func ReadFrameFromBuf(bb buf.ByteBuf, maxPayload int) (Frame, error) {
 	start := bb.ReaderIndex()
 	if bb.ReadableBytes() < 2 {

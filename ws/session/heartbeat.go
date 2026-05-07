@@ -22,6 +22,7 @@ func ensureTimingWheel() {
 type Heartbeater interface {
 	Start(s Session)
 	Stop()
+	Reset(s Session) // cancels the pending ping and re-schedules it
 	SetOnTimeout(fn func())
 }
 
@@ -57,6 +58,13 @@ func (h *perConnHeartbeater) Stop() {
 			h.tw.Cancel(h.pingTask)
 		}
 	})
+}
+
+func (h *perConnHeartbeater) Reset(s Session) {
+	if h.pingTask != 0 {
+		h.tw.Cancel(h.pingTask)
+	}
+	h.schedulePing(s)
 }
 
 func (h *perConnHeartbeater) SetOnTimeout(fn func()) {

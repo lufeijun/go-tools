@@ -70,7 +70,6 @@ func (tw *TimingWheel) Add(delay time.Duration, callback func()) int64 {
 	}
 
 	round := ticks / tw.wheelSize
-	slot := (tw.current + ticks) % tw.wheelSize
 
 	id := atomic.AddInt64(&tw.taskIDSeq, 1)
 	task := &twTask{
@@ -80,10 +79,7 @@ func (tw *TimingWheel) Add(delay time.Duration, callback func()) int64 {
 	}
 
 	tw.mu.Lock()
-	// Slot may have changed if the wheel advanced during lock acquisition,
-	// but the round number is still correct for the original slot.  For
-	// simplicity we use the computed slot; a small drift is acceptable for
-	// heartbeat use cases.
+	slot := (tw.current + ticks) % tw.wheelSize
 	tw.buckets[slot][id] = task
 	tw.mu.Unlock()
 

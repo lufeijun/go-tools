@@ -122,3 +122,41 @@ func kqueueEvents(fd int, events uint32, flags uint16) []unix.Kevent_t {
 	}
 	return kev
 }
+
+// --- wake mechanism (BSD: pipe) ---
+
+func createWakeFd() (int, int, error) {
+	var fds [2]int
+	if err := unix.Pipe(fds[:]); err != nil {
+		return -1, -1, err
+	}
+	unix.SetNonblock(fds[0], true)
+	unix.SetNonblock(fds[1], true)
+	unix.CloseOnExec(fds[0])
+	unix.CloseOnExec(fds[1])
+	return fds[0], fds[1], nil // readFd, writeFd
+}
+
+func doWake(fd int) {
+	if fd < 0 {
+		return
+	}
+	unix.Write(fd, []byte{1})
+}
+
+func drainWake(fd int) {
+	if fd < 0 {
+		return
+	}
+	var buf [8]byte
+	unix.Read(fd, buf[:])
+}
+
+func closeWakeFd(readFd, writeFd int) {
+	if readFd >= 0 {
+		unix.Close(readFd)
+	}
+	if writeFd >= 0 {
+		unix.Close(writeFd)
+	}
+}

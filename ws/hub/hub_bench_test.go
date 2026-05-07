@@ -23,8 +23,10 @@ func newBenchSession(id uint64) *benchSession {
 func (s *benchSession) Conn() conn.Conn                 { return &benchConn{id: s.id, pip: s.pip} }
 func (s *benchSession) State() session.State            { return session.StateConnected }
 func (s *benchSession) StateChan() <-chan session.State { return nil }
-func (s *benchSession) SetState(st session.State)       {}
-func (s *benchSession) Close() error                    { return nil }
+func (s *benchSession) SetState(st session.State)          {}
+func (s *benchSession) SetConn(conn.Conn)                  {}
+func (s *benchSession) SetHeartbeater(session.Heartbeater) {}
+func (s *benchSession) Close() error                       { return nil }
 
 type benchConn struct {
 	id  uint64

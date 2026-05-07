@@ -19,6 +19,7 @@ type Hub interface {
 	Count() int
 	Get(id uint64) session.Session
 	CloseAll()
+	Close() // shuts down background workers
 }
 
 const broadcastQueueSize = 256
@@ -140,5 +141,12 @@ func (h *shardedHub) CloseAll() {
 		for _, sess := range sessions {
 			sess.Close()
 		}
+	}
+}
+
+// Close shuts down all background broadcast workers and releases resources.
+func (h *shardedHub) Close() {
+	for _, w := range h.workers {
+		close(w.ch)
 	}
 }

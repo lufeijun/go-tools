@@ -242,36 +242,62 @@
 
 ## 优先级排序
 
+### 原有规划项状态
+
+| 优先级 | 编号 | 优化项 | 状态 | 说明 |
+|---|---|---|---|---|
+| P0 | 4.1 | ReadFrame MaxFrameSize 校验 | ✅ | |
+| P0 | 4.2 | 分片重组累积长度上限 | ⚠️ | 阻塞 I/O 路径缺少 continuation opcode 校验（§7.1） |
+| P0 | 4.6 | Hub.Send / Broadcast 实现 | ✅ | |
+| P0 | 5.1 | 心跳功能 | ✅ | |
+| P0 | 3.1 | epollConn 非阻塞 I/O | ⚠️ | 主逻辑完成，存在 RemoteAddr nil、onClose 时序等细节问题（§6.14） |
+| P0 | 3.2 | TCP 参数实际生效 | ✅ | |
+| P1 | 4.3 | Handshake 超时 | ✅ | |
+| P1 | 4.4 | Close 帧 RFC 合规 | ⚠️ | closeLocked 中 onClose 在 unix.Close 之后触发（§6.14） |
+| P1 | 4.5 | stateChan / serveConn 泄漏 | ✅ | |
+| P1 | 3.3 | 读缓冲批量预读（bufio） | ✅ | |
+| P1 | 1.1 | 心跳时间轮 | ✅ | |
+| P1 | 2.1 | netConn.Read 池化 | 🔄 | V2.1 |
+| P1 | 2.3 | frame 层 ByteBuf 化 | ✅ | |
+| P2 | 5.2 | 移除 serveConn goroutine | ✅ | epoll 模式下已实现 |
+| P2 | 5.3 | Hub shard false sharing | ⚠️ | 堆分配结构体 padding 效果削弱（§7.7） |
+| P2 | 1.2 | Hub broadcast worker pool | ⚠️ | worker 功能完成但 goroutine 不退出（§6.12） |
+| P2 | 1.4 | EventLoop handler 查找优化 | ✅ | |
+| P2 | 3.4 | 写合并 | 🔄 | V2.1 |
+| P2 | 5.4 | Pipeline ExceptionCaught 实现 | 🔄 | V2.1 |
+| P2 | 5.5 | EventLoop.Stop 资源清理 | ✅ | |
+| P2 | 5.6 | 客户端自动重连 | ⚠️ | 客户端内联逻辑可用，Reconnector 接口不可用（§7.3） |
+| P3 | 1.3 | EventLoop 异步 dispatch | ✅ | |
+| P3 | 1.5 | Pipeline 预编译数组 | ✅ | |
+| P3 | 2.2 | Peek+Skip 零拷贝帧解析 | ✅ | |
+| P3 | 2.4 | mask 原地 XOR | ✅ | |
+| P3 | 2.5 | ByteBuf 扩容对齐 | ✅ | |
+| P3 | 5.7 | benchmark 基线 | ✅ | |
+| P3 | 5.8 | ByteBuf 线程安全文档 | ✅ | |
+
+### 审计新发现项（2026-05-07）
+
 | 优先级 | 编号 | 优化项 | 原因 |
 |---|---|---|---|
-| P0 | 4.1 | ReadFrame MaxFrameSize 校验 | 安全漏洞（DoS），一行代码修复 |
-| P0 | 4.2 | 分片重组累积长度上限 | 安全漏洞（内存耗尽） |
-| P0 | 4.6 | Hub.Send / Broadcast 空实现 | 核心功能缺失 |
-| P0 | 5.1 | 心跳功能未工作 | 功能缺失，TCP 半开连接永不清理 |
-| P0 | 3.1 | epollConn 非阻塞 I/O | V2.1 核心交付物，支撑百万连接的前提 |
-| P0 | 3.2 | TCP 参数实际生效 | 配置已定义但代码未使用，低垂果实 |
-| P1 | 4.3 | Handshake 超时 | 健壮性，防止 goroutine 泄漏 |
-| P1 | 4.4 | Close 帧 RFC 合规 | 协议合规，避免异常断开 |
-| P1 | 4.5 | stateChan / serveConn 泄漏 | goroutine/channel 泄漏 |
-| P1 | 3.3 | 读缓冲批量预读（bufio） | 低改动高回报，syscall 从 5 次降至 1 次 |
-| P1 | 1.1 | 心跳时间轮 | 10 万+连接 goroutine 开销最大来源 |
-| P1 | 2.1 | netConn.Read 池化 | 高频 alloc，改动小收益大 |
-| P1 | 2.3 | frame 层 ByteBuf 化 | 帧解析是数据路径 alloc 最密集处 |
-| P2 | 5.2 | 移除 serveConn goroutine | V2 核心目标，需配合 epollConn |
-| P2 | 5.3 | Hub shard false sharing | 高并发优化 |
-| P2 | 1.2 | Hub broadcast worker pool | 高频广播 goroutine 开销 |
-| P2 | 1.4 | EventLoop handler 查找优化 | 消除锁竞争 |
-| P2 | 3.4 | 写合并 | 提升小消息吞吐 |
-| P2 | 5.4 | Pipeline ExceptionCaught 实现 | 调试体验 |
-| P2 | 5.5 | EventLoop.Stop 资源清理 | 资源泄漏 |
-| P2 | 5.6 | 客户端自动重连 | 客户端可用性 |
-| P3 | 1.3 | EventLoop 异步 dispatch | 需引入 goroutine pool，复杂度较高 | ✅ |
-| P3 | 1.5 | Pipeline 预编译数组 | micro-optimization | ✅ |
-| P3 | 2.2 | Peek+Skip 零拷贝帧解析 | 推广 ByteBuf 零拷贝模式 | ✅ |
-| P3 | 2.4 | mask 原地 XOR | 有收益但需 careful 处理 ownership | ✅ |
-| P3 | 2.5 | ByteBuf 扩容对齐 | 微优化 | ✅ |
-| P3 | 5.7 | benchmark 基线 | 工程化 | ✅ |
-| P3 | 5.8 | ByteBuf 线程安全文档 | 工程化 | ✅ |
+| P0 | A1 | EventLoop.Wake() 未实现 | Stop() 有 100ms 延迟退出；外部无法唤醒 epoll_wait（§7.4） |
+| P0 | A2 | DialNonBlock 仅 IPv4 | IPv6 地址静默连接到 0.0.0.0（§6.10） |
+| P0 | A3 | 客户端 ConnID 硬编码为 1 | 重连 ID 冲突（§6.11） |
+| P0 | A4 | `readFrameBufWithAccumulated` payload 提取错误 | Peek 读到帧头而非 payload（§6.8） |
+| P1 | A5 | `session.State()` data race | `s.state` 无锁读写（§6.9） |
+| P1 | A6 | 阻塞 I/O 缺少 continuation opcode 校验 | RFC 6455 协议合规（§7.1） |
+| P1 | A7 | Hub broadcast worker goroutine 泄漏 | 32 个 goroutine 永不退出（§6.12） |
+| P1 | A8 | `session.Close()` 不停止心跳 | 向已关闭 pipeline 发送数据（§7.8） |
+| P1 | A9 | Reconnector 接口不可用 | 死代码 + 不更新 conn + 固定间隔无退避（§7.3） |
+| P2 | A10 | `StateConnecting` 从不被使用 | 状态机与实际代码路径不一致（§6.13） |
+| P2 | A11 | 时间轮 `tw.current` data race | 无锁读取（§7.6） |
+| P2 | A12 | `poller.Open()` 错误被丢弃 | 失败时 fd=0 导致未定义行为（§7.5） |
+| P2 | A13 | `epollConn.RemoteAddr/LocalAddr` 返回 nil | 调用方可能 nil panic |
+| P2 | A14 | `ReadFrameFromBuf` 不处理分片 | API 不一致（§7.2） |
+| P3 | A15 | ByteBuf 接口缺少 `Reset` 方法 | 与 DESIGN.md 不一致（§7.10） |
+| P3 | A16 | Heartbeater 接口缺少 `Reset()` | 与 DESIGN.md 不一致（§7.9） |
+| P3 | A17 | `frame/pool.go` 死代码 | 无生产调用方（§7.11） |
+| P3 | A18 | Session 接口缺少 Connect/Heartbeater/Reconnector | 与 DESIGN.md 不一致 |
+| P3 | A19 | 多处错误被静默丢弃 | ConnWriter/FrameCodec/el.Mod 等 |
 
 ---
 
@@ -393,6 +419,105 @@
 - **教训**：
   - 连接层的 Close 必须有向上通知的机制。底层关闭 fd 不等于上层知道连接已断开——中间隔了 EpollConn → Pipeline → Session → 业务层，每一层都需要被通知
   - 状态变更 channel 如果有多个消费者，不能用单一 channel（消费者竞争），必须用 pub/sub 或 fan-out 模式
+
+### 6.8 `readFrameBufWithAccumulated` Peek 读到帧头而非 payload
+
+- **现象**：`ReadFrameBuf` 返回的 `Frame.Payload` 指向 ByteBuf 中错误的位置（帧头字节）
+- **根因**：`frame.go:371` 使用 `bb.Peek(headerSize)` 获取 payload，但 ByteBuf 的 `readerIndex` 始终为 0（从未被 `Skip` 推进），`Peek(n)` 从 `readerIndex` 开始读，读到的是帧头。正确的写法是 `bb.Bytes()[headerSize : headerSize+payloadLen]`，与分片路径（`frame.go:403`）一致
+- **影响**：`ReadFrameBuf` 当前无调用方，是 latent bug。一旦有代码使用此 API 将得到错误数据
+- **教训**：零拷贝 API 中，`Peek` 的语义是从 `readerIndex` 开始读，如果 readerIndex 未被推进，Peek 读到的是 buffer 开头而非 payload 位置
+
+### 6.9 `session.State()` 与 `SetState()` 存在 data race
+
+- **现象**：`go test -race` 可检测到 `s.state` 的并发读写冲突
+- **根因**：`State()` 无锁读取 `s.state`，`SetState()` 在 `mu.Lock()` 之外写入 `s.state`（`session.go:100`）。Go 内存模型下，即使 `State` 是 `int`（机器字），无同步的并发读写也是 data race
+- **修复**：`State()` 中加 `s.mu.RLock()` 或用 `atomic.Value` 包装
+- **教训**：状态字段如果有多个 goroutine 访问（pub/sub 模型下必然有），必须做同步保护
+
+### 6.10 `DialNonBlock` 仅支持 IPv4
+
+- **现象**：DNS 返回 IPv6 地址时静默连接到 0.0.0.0
+- **根因**：`dial_linux.go:17` 硬编码 `unix.AF_INET`，且 `tcpAddr.IP.To4()` 对 IPv6 返回 nil，`sa.Addr` 保持零值
+- **修复**：根据 `tcpAddr.IP` 类型选择 `AF_INET` + `SockaddrInet4` 或 `AF_INET6` + `SockaddrInet6`
+- **教训**：网络编程中不能假设所有地址都是 IPv4
+
+### 6.11 客户端 ConnID 硬编码为 1
+
+- **现象**：客户端重连时新旧连接 ID 冲突
+- **根因**：`client.go:122` `conn.NewNetConn(nc, true, 1)` 硬编码 ID=1，而非调用 `conn.NextConnID()`
+- **修复**：改为 `conn.NewNetConn(nc, true, conn.NextConnID())`
+- **教训**：任何创建连接的地方必须使用全局递增 ID，不能硬编码
+
+### 6.12 Hub broadcast worker goroutine 永不退出
+
+- **现象**：`Server.Stop()` 后仍有 32 个 goroutine 存活
+- **根因**：`hub.go:55` worker 循环 `for msg := range w.ch`，但 `CloseAll()` 和 `Stop()` 均不关闭 worker channel
+- **修复**：给 `shardedHub` 添加 `stop()` 方法，关闭所有 worker channel
+- **教训**：固定 worker pool 必须有明确的停止机制，且停止路径需被 Server.Stop() 触发
+
+### 6.13 `StateConnecting` 状态从不被使用
+
+- **现象**：状态机定义了 `Disconnected → Connecting → Connected` 但 `StateConnecting` 永不可达
+- **根因**：server 和 client 的 `initSession` 直接将状态从 `Disconnected` 设为 `Connected`，跳过 `Connecting`
+- **修复**：在 `Connect()` / handshake 前设置 `StateConnecting`，成功后设置 `StateConnected`
+- **教训**：状态机定义必须与实际代码路径一致，否则 stateChan 订阅者观察到的是不完整的状态序列
+
+### 6.14 `epollConn.closeLocked` 在 fd 关闭后触发 `onClose` 回调
+
+- **现象**：`onClose` 回调中无法安全操作 fd（如读取状态、Deregister）
+- **根因**：`epollconn.go:174` 先 `unix.Close(c.fd)`，然后才调用 `c.onClose()`（line 176）。回调中任何涉及 fd 的操作都会失败
+- **修复**：交换顺序——先触发 `c.onClose()` 回调，再执行 `unix.Close(c.fd)`
+- **教训**：资源清理回调必须在资源释放**之前**触发，否则回调持有的是无效句柄
+
+---
+
+## 七、V2.0 实现审计发现（2026-05-07）
+
+基于 DESIGN.md 对全部代码的逐层审查，以下为未在 plan.md 原有规划中覆盖的新发现问题。每个问题均对应上方优先级表中的 A1-A19。
+
+### 7.1 阻塞 I/O 路径缺少 continuation-frame opcode 校验
+
+`readFrameWithAccumulated` 和 `readFrameBufWithAccumulated`（`frame.go`）处理分片时不校验后续帧 opcode 是否为 0x0（RFC 6455 §5.4 要求）。对比 `IncrementalParser.tryParseFrame`（`parser.go:159`）正确做了此校验。**违反协议合规。**
+
+### 7.2 `ReadFrameFromBuf` 不处理分片消息
+
+`frame.go:421-483` 的 `ReadFrameFromBuf` 只解析单帧，遇到分片消息只返回第一帧。与 `ReadFrame`/`ReadFrameBuf` 的分片支持不一致。
+
+### 7.3 `Reconnector` 接口实现不可用
+
+`session/reconnect.go` 的 `Reconnector` 存在三个问题：重连成功后不更新 session conn（`_ = c` TODO）、使用固定间隔而非 DESIGN.md 规定的指数退避（5s→2x→60s）、客户端实际使用 `client.go` 内联的 `maybeReconnect()` 而非此接口。当前是死代码。
+
+### 7.4 `Wake()` 未实现
+
+`eventloop.go:158-161` 的 `Wake()` 是空 TODO stub。`Stop()` 调用 `close(stopCh)` 后依赖 `poller.Wait(100)` 的 100ms 超时来退出，无法立即中断阻塞的 `epoll_wait`。需用 eventfd（Linux）或 pipe（BSD）实现。
+
+### 7.5 `poller.Open()` 错误被静默丢弃
+
+`eventloop.go:112` 丢弃 `poller.Open()` 的错误。`Open()` 失败时 `epfd` 为零值（fd=0 即 stdin），后续所有 poller 操作在 fd 0 上执行，行为未定义。
+
+### 7.6 时间轮 `tw.current` 无锁读取
+
+`timingwheel.go:73` 的 `Add()` 中 `slot := (tw.current + ticks) % tw.wheelSize` 不加锁读取 `tw.current`，而 `advance()` 在锁内写入（line 138）。Go 内存模型下这是 data race。
+
+### 7.7 Hub cache line padding 对堆分配结构体效果削弱
+
+`hub.go:70-75` 的分片通过 `&shard{}` 独立堆分配。Go 分配器不保证跨分配块的 cache line 对齐——相邻分片可能共享 cache line，padding 只保证单个结构体不跨越 cache line。
+
+### 7.8 `session.Close()` 不停止心跳
+
+`session.go:111-126` 的 `Close()` 清理订阅者并关闭连接，但不停 `perConnHeartbeater`。时间轮上的 ping 任务继续触发，向已关闭的 pipeline 发送数据。
+
+### 7.9 Heartbeater 接口缺少 `Reset()`
+
+DESIGN.md §3.6 规定了 `Heartbeater` 接口的 `Reset()` 方法。`heartbeat.go:22-26` 实际接口只有 `Start()`、`Stop()`、`SetOnTimeout()`。
+
+### 7.10 ByteBuf 接口缺少 `Reset` 方法
+
+DESIGN.md §3.2 列出 `ByteBuf` 接口方法包含 `Reset`。`buf/bytebuf.go:23-42` 接口定义和实现均缺失此方法。
+
+### 7.11 `frame/pool.go` 是死代码
+
+`GetBuf`/`PutBuf` 仅在其自身测试中被引用。`frame.go` 的生产代码使用 `make([]byte, ...)` 直接分配，`parser.go` 也不使用这些池函数。
 
 ---
 

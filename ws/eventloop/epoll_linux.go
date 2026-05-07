@@ -113,3 +113,48 @@ func fromEpollEvents(e uint32) uint32 {
 	}
 	return events
 }
+
+// --- wake mechanism (Linux: eventfd) ---
+
+func createWakeFd() (int, int, error) {
+	fd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if err != nil {
+		return -1, -1, err
+	}
+	return fd, fd, nil // readFd == writeFd for eventfd
+}
+
+func doWake(fd int) {
+	if fd < 0 {
+		return
+	}
+	var val uint64 = 1
+	unix.Write(fd, uint64ToBytes(val))
+}
+
+func drainWake(fd int) {
+	if fd < 0 {
+		return
+	}
+	var buf [8]byte
+	unix.Read(fd, buf[:])
+}
+
+func closeWakeFd(readFd, writeFd int) {
+	if readFd >= 0 {
+		unix.Close(readFd)
+	}
+}
+
+func uint64ToBytes(v uint64) []byte {
+	var b [8]byte
+	b[0] = byte(v)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v >> 16)
+	b[3] = byte(v >> 24)
+	b[4] = byte(v >> 32)
+	b[5] = byte(v >> 40)
+	b[6] = byte(v >> 48)
+	b[7] = byte(v >> 56)
+	return b[:]
+}

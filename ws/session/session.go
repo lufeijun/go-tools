@@ -50,6 +50,8 @@ type Session interface {
 	State() State
 	StateChan() <-chan State
 	SetState(State)
+	SetConn(conn.Conn)
+	SetHeartbeater(Heartbeater)
 	Close() error
 }
 
@@ -59,9 +61,10 @@ type defaultSession struct {
 	config Config
 	state  State
 	closed int32
+	hb     Heartbeater
 
-	mu       sync.Mutex
-	subs     map[chan State]struct{}
+	mu   sync.RWMutex
+	subs map[chan State]struct{}
 }
 
 // NewSession creates a new Session.
@@ -74,7 +77,15 @@ func NewSession(c conn.Conn, cfg Config) Session {
 }
 
 func (s *defaultSession) Conn() conn.Conn { return s.conn }
-func (s *defaultSession) State() State    { return s.state }
+
+func (s *defaultSession) State() State {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state
+}
+
+func (s *defaultSession) SetConn(c conn.Conn)  { s.conn = c }
+func (s *defaultSession) SetHeartbeater(hb Heartbeater) { s.hb = hb }
 
 // StateChan returns a new channel that receives state changes.
 // Each call creates a fresh subscriber; messages are broadcast to all subscribers.
@@ -97,8 +108,8 @@ func (s *defaultSession) SetState(st State) {
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return
 	}
-	s.state = st
 	s.mu.Lock()
+	s.state = st
 	for ch := range s.subs {
 		select {
 		case ch <- st:
@@ -110,8 +121,11 @@ func (s *defaultSession) SetState(st State) {
 
 func (s *defaultSession) Close() error {
 	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
-		s.state = StateClosed
+		if s.hb != nil {
+			s.hb.Stop()
+		}
 		s.mu.Lock()
+		s.state = StateClosed
 		for ch := range s.subs {
 			select {
 			case ch <- StateClosed:

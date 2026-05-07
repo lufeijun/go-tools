@@ -285,6 +285,7 @@ func (w *writeBuf) ReaderIndex() int                    { return 0 }
 func (w *writeBuf) WriterIndex() int                    { return w.bb.Len() }
 func (w *writeBuf) SetReaderIndex(v int)                {}
 func (w *writeBuf) SetWriterIndex(v int)                {}
+func (w *writeBuf) Reset()                              {}
 
 func TestReadFrameFromBuf_TextUnmasked(t *testing.T) {
 	raw := []byte{0x81, 0x05, 'H', 'e', 'l', 'l', 'o'}

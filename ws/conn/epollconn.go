@@ -56,8 +56,43 @@ func (c *EpollConn) Pipeline() pipeline.ChannelPipeline { return c.pipeline }
 func (c *EpollConn) FD() int                            { return c.fd }
 func (c *EpollConn) IsClient() bool                     { return c.isClient }
 func (c *EpollConn) Active() bool                       { return atomic.LoadInt32(&c.active) == 1 }
-func (c *EpollConn) RemoteAddr() net.Addr               { return nil } // TODO: resolve from fd
-func (c *EpollConn) LocalAddr() net.Addr                { return nil } // TODO: resolve from fd
+func (c *EpollConn) RemoteAddr() net.Addr {
+	sa, err := unix.Getpeername(c.fd)
+	if err != nil {
+		return nil
+	}
+	return sockaddrToNetAddr(sa)
+}
+
+func (c *EpollConn) LocalAddr() net.Addr {
+	sa, err := unix.Getsockname(c.fd)
+	if err != nil {
+		return nil
+	}
+	return sockaddrToNetAddr(sa)
+}
+
+func sockaddrToNetAddr(sa unix.Sockaddr) net.Addr {
+	switch a := sa.(type) {
+	case *unix.SockaddrInet4:
+		return &net.TCPAddr{IP: append(net.IP{}, a.Addr[:]...), Port: a.Port}
+	case *unix.SockaddrInet6:
+		return &net.TCPAddr{IP: append(net.IP{}, a.Addr[:]...), Port: a.Port, Zone: zoneName(a.ZoneId)}
+	default:
+		return nil
+	}
+}
+
+func zoneName(id uint32) string {
+	if id == 0 {
+		return ""
+	}
+	ifi, err := net.InterfaceByIndex(int(id))
+	if err != nil {
+		return ""
+	}
+	return ifi.Name
+}
 
 // SetOnFrame sets the callback function that will be invoked when a complete frame is received.
 func (c *EpollConn) SetOnFrame(fn func(frame.Frame)) {

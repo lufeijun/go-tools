@@ -39,6 +39,7 @@ type ByteBuf interface {
 	WriterIndex() int
 	SetReaderIndex(int)
 	SetWriterIndex(int)
+	Reset() // resets reader and writer indexes to 0
 }
 
 // byteBuf is the default ByteBuf implementation.
@@ -182,3 +183,8 @@ func (b *byteBuf) ReaderIndex() int     { return b.readerIndex }
 func (b *byteBuf) WriterIndex() int     { return b.writerIndex }
 func (b *byteBuf) SetReaderIndex(v int) { b.readerIndex = v }
 func (b *byteBuf) SetWriterIndex(v int) { b.writerIndex = v }
+
+func (b *byteBuf) Reset() {
+	b.readerIndex = 0
+	b.writerIndex = 0
+}

@@ -130,6 +130,8 @@ func (s *defaultServer) initSession(c conn.Conn, nc net.Conn) session.Session {
 		sess.SetState(session.StateDisconnected)
 		c.Close()
 	})
+	sess.SetHeartbeater(hb)
+	sess.SetState(session.StateConnecting)
 	sess.SetState(session.StateConnected)
 	hb.Start(sess)
 
@@ -240,5 +242,7 @@ func (s *defaultServer) Stop() error {
 	// Close all registered connections so serveConn goroutines can exit.
 	s.hub.CloseAll()
 	s.wg.Wait()
+	// Shut down hub background workers.
+	s.hub.Close()
 	return nil
 }
